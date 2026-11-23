@@ -661,6 +661,24 @@ async fn clear_records_empties_the_callers_repo_in_one_commit() {
         "{ops:?}"
     );
 
+    // The clear reaches the writer set like any write: the author's entry
+    // moves to the new rev.
+    let (status, writers) = get(
+        &app,
+        &authority,
+        "listRepos",
+        &format!("space={}", urlencoding::encode(&space)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{writers}");
+    let entry = writers["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["did"] == author.as_str())
+        .unwrap_or_else(|| panic!("{writers}"));
+    assert_eq!(entry["repoRev"], after["commit"]["rev"], "{writers}");
+
     // Another account's records are untouched.
     let (_, theirs) = get(
         &app,
