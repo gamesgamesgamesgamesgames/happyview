@@ -1023,3 +1023,34 @@ async fn get_blob_by_repo_answers_an_outsider_the_same_whatever_the_blob() {
     assert_eq!(referenced, unreferenced, "{a} / {b}");
     assert_eq!(a, b);
 }
+
+#[tokio::test]
+#[serial]
+async fn op_entries_by_repo_carry_the_lexicon_fields_only() {
+    common::require_db!();
+    let (app, space, authority, author) = setup("entryshape").await;
+    write(&app, &space, &author, COLLECTION, "one").await;
+
+    let (_, body) = get(&app, &authority, "listRepoOps", &q(&space, "repo", &author)).await;
+    let op = body["ops"][0].as_object().unwrap();
+    let mut keys: Vec<&str> = op.keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["cid", "collection", "prev", "rev", "rkey", "value"],
+        "{body}"
+    );
+
+    let (_, body) = get(
+        &app,
+        &authority,
+        "listRepoOps",
+        &format!("{}&excludeValues=true", q(&space, "repo", &author)),
+    )
+    .await;
+    assert!(body["ops"][0].get("value").is_none(), "{body}");
+
+    // The earlier request keeps its entries as they were.
+    let (_, body) = get(&app, &authority, "listRepoOps", &q(&space, "did", &author)).await;
+    assert!(body["ops"][0].get("idx").is_some(), "{body}");
+}

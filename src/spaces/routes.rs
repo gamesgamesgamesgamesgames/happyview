@@ -610,6 +610,20 @@ fn space_ref(space: &Space) -> String {
     )
 }
 
+/// Op log entries in the lexicons' shape (`listRepoOps#opEntry`): `rev`,
+/// `collection`, `rkey`, `cid`, `prev` and, where inlined, `value`. A `did`
+/// request keeps HappyView's fuller entries.
+fn lexicon_op_entries(ops: &mut serde_json::Value) {
+    const FIELDS: [&str; 6] = ["rev", "collection", "rkey", "cid", "prev", "value"];
+    if let Some(ops) = ops.as_array_mut() {
+        for op in ops {
+            if let Some(op) = op.as_object_mut() {
+                op.retain(|k, _| FIELDS.contains(&k.as_str()));
+            }
+        }
+    }
+}
+
 fn lexicon_commit_json(commit: &crate::spaces::space_mac::Commit) -> serde_json::Value {
     serde_json::json!({
         "ver": commit.ver,
@@ -1945,6 +1959,12 @@ async fn list_repo_ops(
             None => None,
         },
     };
+
+    let mut ops = serde_json::to_value(&ops)
+        .map_err(|e| AppError::Internal(format!("failed to encode ops: {e}")))?;
+    if named == RepoParam::Repo {
+        lexicon_op_entries(&mut ops);
+    }
 
     Ok(Json(serde_json::json!({
         "ops": ops,
