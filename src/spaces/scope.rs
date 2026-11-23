@@ -160,7 +160,10 @@ pub async fn require_space_scope(
     )
     .await?
     else {
-        return Ok(());
+        // DPoP claims with no session behind them hold no grant at all.
+        return Err(AppError::Forbidden(
+            "this session is not authorized for this space: no session is registered for it".into(),
+        ));
     };
 
     let granted = ScopePermissions::parse(&scopes);
@@ -267,6 +270,25 @@ mod space_scope_gate_tests {
     async fn test_state() -> AppState {
         let pool = crate::test_support::migrated_memory_pool().await;
         crate::test_support::test_state_with_pool(pool)
+    }
+
+    #[tokio::test]
+    async fn dpop_claims_with_no_session_behind_them_are_refused() {
+        let state = test_state().await;
+        let claims = session_with_scopes(
+            &state,
+            &format!("atproto space:com.example.forum?authority={USER}"),
+        )
+        .await;
+        crate::db::query("DELETE FROM happyview_dpop_sessions")
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        let err = require_space_scope(&state, &claims, &a_space(), SpaceTarget::Read)
+            .await
+            .expect_err("no session means no grant");
+        assert!(matches!(err, AppError::Forbidden(_)), "{err:?}");
     }
 
     #[tokio::test]

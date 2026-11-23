@@ -737,7 +737,7 @@ async fn refresh_access_token(
     encryption_key: &[u8; 32],
     oauth_registry: &Arc<OAuthClientRegistry>,
     creds: &mut DpopCredentials,
-) -> Result<(), AppError> {
+) -> Result<Option<String>, AppError> {
     let refresh_token = creds
         .session
         .refresh_token
@@ -844,13 +844,17 @@ fn is_use_dpop_nonce_error(body: &str) -> bool {
 }
 
 /// Parse a successful token refresh response body and update the stored session.
+///
+/// Answers the scope the response reports, when its `sub` is the session's
+/// DID: what the authorization server says it granted, which the scope the app
+/// registered with is not.
 async fn apply_refresh_response(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     encryption_key: &[u8; 32],
     creds: &mut DpopCredentials,
     body: &str,
-) -> Result<(), AppError> {
+) -> Result<Option<String>, AppError> {
     let token_resp: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| AppError::Internal(format!("invalid token refresh response: {e}")))?;
 
@@ -899,6 +903,119 @@ async fn apply_refresh_response(
         "refreshed DPoP access token"
     );
 
+    let granted = (token_resp["sub"].as_str() == Some(creds.session.user_did.as_str()))
+        .then(|| token_resp["scope"].as_str().map(str::to_string))
+        .flatten();
+    Ok(granted)
+}
+
+/// The scope a DPoP session's authorization server granted, read from a
+/// refresh HappyView makes itself.
+///
+/// The scope an app registers a session with is the app's word, and so is
+/// the scope in the token response it relays. A refresh is not: the token
+/// response HappyView receives carries the granted scope, with any `include:`
+/// already expanded. The refresh goes to the session's issuer only once the
+/// user's own PDS lists it, since an app that could pick the issuer could pick
+/// the answer. It rotates the session's tokens. Answers the grant along with
+/// the session's `updated_at` as that refresh left it, so the caller can act
+/// only on the row it checked.
+#[allow(clippy::too_many_arguments)]
+pub async fn refresh_for_granted_scope(
+    http: &reqwest::Client,
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    encryption_key: &[u8; 32],
+    oauth_registry: &Arc<OAuthClientRegistry>,
+    plc_url: &str,
+    api_client_id: &str,
+    user_did: &str,
+    dpop_key_id: &str,
+) -> Result<(String, String), AppError> {
+    let slot = refresh_lock(api_client_id, user_did, dpop_key_id);
+    let _guard = slot.lock().await;
+
+    let mut creds = resolve_credentials(
+        http,
+        pool,
+        backend,
+        encryption_key,
+        plc_url,
+        api_client_id,
+        user_did,
+        dpop_key_id,
+    )
+    .await?;
+
+    let issuer = creds.session.issuer.clone().ok_or_else(issuer_refused)?;
+    let pds = resolve_pds_from_did(http, plc_url, user_did).await?;
+    verify_issuer_of(http, &pds, &issuer).await?;
+
+    let granted = refresh_access_token(
+        http,
+        pool,
+        backend,
+        encryption_key,
+        oauth_registry,
+        &mut creds,
+    )
+    .await?
+    .ok_or_else(|| {
+        AppError::Forbidden(
+            "the authorization server did not say what it granted this session".into(),
+        )
+    })?;
+    let updated_at = super::sessions::get_dpop_session_updated_at(
+        pool,
+        backend,
+        api_client_id,
+        user_did,
+        dpop_key_id,
+    )
+    .await?
+    .ok_or_else(|| {
+        AppError::Conflict("the session was removed while it was being checked".into())
+    })?;
+    Ok((granted, updated_at))
+}
+
+fn issuer_refused() -> AppError {
+    AppError::Forbidden("the session's authorization server is not the account's".into())
+}
+
+/// Refuses an issuer that `pds`, the PDS named in the account's DID document,
+/// does not list as its authorization server, or whose metadata names a
+/// different issuer (RFC 8414 §3.3).
+async fn verify_issuer_of(http: &reqwest::Client, pds: &str, issuer: &str) -> Result<(), AppError> {
+    let same = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
+    let resource_url = format!(
+        "{}/.well-known/oauth-protected-resource",
+        pds.trim_end_matches('/')
+    );
+    let resource: serde_json::Value = http
+        .get(&resource_url)
+        .send()
+        .await
+        .map_err(|e| AppError::BadGateway(format!("failed to fetch PDS resource metadata: {e}")))?
+        .json()
+        .await
+        .map_err(|e| AppError::BadGateway(format!("invalid PDS resource metadata: {e}")))?;
+    let listed = resource["authorization_servers"]
+        .as_array()
+        .is_some_and(|servers| {
+            servers
+                .iter()
+                .filter_map(|s| s.as_str())
+                .any(|s| same(s, issuer))
+        });
+    if !listed {
+        return Err(issuer_refused());
+    }
+
+    let metadata = fetch_auth_server_metadata(http, issuer).await?;
+    if !metadata["issuer"].as_str().is_some_and(|s| same(s, issuer)) {
+        return Err(issuer_refused());
+    }
     Ok(())
 }
 

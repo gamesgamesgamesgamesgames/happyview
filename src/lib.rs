@@ -44,6 +44,7 @@ pub mod telemetry;
 pub mod telemetry_middleware;
 #[cfg(test)]
 pub mod test_support;
+pub mod update_check;
 pub mod verification_methods;
 pub mod version;
 pub mod xrpc;
@@ -99,11 +100,33 @@ pub struct AppState {
     pub attestation_signer: Option<Arc<plugin::attestation::AttestationSigner>>,
     pub official_registry: SharedRegistry,
     pub official_registry_config: RegistryConfig,
+    /// What the last check for a newer HappyView found.
+    pub update_status: update_check::SharedUpdateStatus,
     pub proxy_config: Arc<arc_swap::ArcSwap<proxy_config::ProxyConfig>>,
     pub backfill_events_tx: tokio::sync::broadcast::Sender<crate::admin::types::BackfillEvent>,
     pub verbose_event_logging: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub client_jwks: Vec<jose_jwk::Jwk>,
     pub telemetry_counters: std::sync::Arc<telemetry::counters::Counters>,
+
+    /// How `db.raw` is isolated on Postgres, decided once at boot. See
+    /// [`PluginSqlAccess`].
+    pub plugin_sql: PluginSqlAccess,
+}
+
+/// How `db.raw` runs on Postgres. Decided at boot and fixed for the process.
+#[derive(Clone)]
+pub enum PluginSqlAccess {
+    /// Its own pool, logged in as the verified unprivileged `happyview_plugin`
+    /// role — the strongest isolation.
+    LoginPool(sqlx::AnyPool),
+    /// The main connection behind the tokenizer guard (today's behaviour). Also
+    /// used on SQLite, which has no such role.
+    Guard,
+    /// `db.raw` is refused on Postgres: `PLUGIN_SQL_DATABASE_URL` was set but the
+    /// login pool could not be opened or verified, or the plugin schema holds
+    /// code from an earlier login-pool session. HappyView still boots; only
+    /// `db.raw` is refused.
+    Refused,
 }
 
 impl axum::extract::FromRef<AppState> for axum_extra::extract::cookie::Key {

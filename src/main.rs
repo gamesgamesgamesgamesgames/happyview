@@ -50,6 +50,14 @@ async fn main() {
         "connected to database"
     );
 
+    // Decide how `db.raw` is isolated on Postgres (fixed for the process).
+    let plugin_sql = happyview::lua::db_api::decide_plugin_sql_access(
+        &db_pool,
+        db_backend,
+        std::env::var("PLUGIN_SQL_DATABASE_URL").ok().as_deref(),
+    )
+    .await;
+
     // The backfill re-mints commits, so it needs the space signing key.
     let space_signing_key = match config.token_encryption_key.as_ref() {
         Some(key) => happyview::spaces::service::signing_key_from_pool(&db_pool, db_backend, key)
@@ -887,6 +895,22 @@ async fn main() {
         official_registry.clone(),
     );
 
+    // v2 has no telemetry_managed_by, so a 2.x instance is never reported as
+    // run by a hosting platform.
+    let update_check_config = happyview::update_check::UpdateCheckConfig::from_env(&config.plc_url);
+    let update_status = happyview::update_check::UpdateStatus::initial(
+        happyview::version::version(),
+        update_check_config.enabled,
+        false,
+    )
+    .into_shared();
+    happyview::update_check::spawn_check_task(
+        update_check_config,
+        update_status.clone(),
+        db_pool.clone(),
+        db_backend,
+    );
+
     let proxy_config = {
         let json_str =
             happyview::admin::settings::get_setting(&db_pool, "xrpc_proxy_config", db_backend)
@@ -932,11 +956,13 @@ async fn main() {
         attestation_signer,
         official_registry,
         official_registry_config,
+        update_status,
         proxy_config,
         backfill_events_tx,
         verbose_event_logging,
         client_jwks,
         telemetry_counters,
+        plugin_sql,
     };
 
     jetstream::spawn(state.clone(), collections_rx);
@@ -1022,7 +1048,7 @@ async fn main() {
 
 async fn seed_and_load_rate_limit_defaults(
     pool: &sqlx::AnyPool,
-    backend: happyview::db::DatabaseBackend,
+    backend: db::DatabaseBackend,
 ) -> RateLimitDefaults {
     use happyview::rate_limit::{
         SEED_DEFAULT_PROCEDURE_COST, SEED_DEFAULT_PROXY_COST, SEED_DEFAULT_QUERY_COST,
@@ -1031,7 +1057,7 @@ async fn seed_and_load_rate_limit_defaults(
 
     async fn seed_and_read(
         pool: &sqlx::AnyPool,
-        backend: happyview::db::DatabaseBackend,
+        backend: db::DatabaseBackend,
         key: &str,
         seed: u32,
     ) -> u32 {
