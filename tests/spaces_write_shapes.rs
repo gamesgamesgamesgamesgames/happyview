@@ -479,6 +479,23 @@ async fn the_earlier_shape_keeps_its_answers() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["results"][0].get("$type").is_none(), "{body}");
 
+    // A write with an `action` is read by it, whatever its `$type` names.
+    let (status, body) = post(
+        &app,
+        &author,
+        "applyWrites",
+        json!({ "space": space, "writes": [{ "$type": DELETE, "action": "create", "collection": COLLECTION, "rkey": "b", "value": record("b") }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["results"][0]["uri"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("/b"),
+        "{body}"
+    );
+
     // A malformed write is a 422, as before.
     let (status, body) = post(
         &app,

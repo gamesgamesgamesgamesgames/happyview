@@ -289,12 +289,15 @@ struct ApplyWritesBatch {
     shape: WritesShape,
 }
 
-/// Whether a write is tagged by the lexicons' `$type` union.
+/// Whether a write is tagged by the lexicons' `$type` union. A write with an
+/// `action` is HappyView's earlier shape, whatever its `$type` says, as it
+/// always was.
 fn is_lexicon_write(write: &serde_json::Value) -> bool {
-    write
-        .get("$type")
-        .and_then(|t| t.as_str())
-        .is_some_and(|t| t.starts_with(LEXICON_WRITE_PREFIX))
+    write.get("action").is_none()
+        && write
+            .get("$type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.starts_with(LEXICON_WRITE_PREFIX))
 }
 
 /// Read an `applyWrites` body. A batch none of whose writes names a lexicon

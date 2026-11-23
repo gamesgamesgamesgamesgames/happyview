@@ -845,6 +845,7 @@ mod space_scope_gate_tests {
         let input = scopes(&[
             "atproto",
             "space:com.example.forum",
+            "space?spaceType=com.example.forum&authority=*",
             "repo:com.example.post",
         ]);
         let out = drop_space_scopes_if_unsupported(&state, "not a handle", input).await;
@@ -951,6 +952,22 @@ mod space_scope_gate_tests {
 
         enqueue_space_migrations(&state, MIGRATING_USER).await;
         assert_eq!(pending_jobs(&state).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_space_scope_granted_in_the_named_form_enqueues_too() {
+        let state = migration_state().await;
+        enable_migration(&state).await;
+        seed_session(
+            &state,
+            MIGRATING_USER,
+            Some("atproto space?spaceType=com.example.forum&authority=*"),
+        )
+        .await;
+        seed_polyfill_repo(&state, "space-a", MIGRATING_USER).await;
+
+        enqueue_space_migrations(&state, MIGRATING_USER).await;
+        assert_eq!(pending_jobs(&state).await, 1);
     }
 
     #[tokio::test]
