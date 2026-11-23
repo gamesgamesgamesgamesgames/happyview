@@ -285,8 +285,8 @@ enum WritesShape {
 
 const LEXICON_WRITE_PREFIX: &str = "com.atproto.space.applyWrites#";
 
-/// The most writes one lexicon-shaped `applyWrites` takes, as the reference.
-const MAX_LEXICON_WRITES: usize = 200;
+/// The most writes one `applyWrites` takes, in either shape, as the reference.
+const MAX_WRITES: usize = 200;
 
 /// Read a batch's writes, in either shape. A batch is one shape throughout.
 fn parse_writes(writes: Vec<serde_json::Value>) -> Result<(Vec<WriteOp>, WritesShape), AppError> {
@@ -319,10 +319,8 @@ fn parse_writes(writes: Vec<serde_json::Value>) -> Result<(Vec<WriteOp>, WritesS
         );
     }
     let shape = shape.unwrap_or(WritesShape::Action);
-    if shape == WritesShape::Lexicon && ops.len() > MAX_LEXICON_WRITES {
-        return Err(invalid(format!(
-            "too many writes: at most {MAX_LEXICON_WRITES}"
-        )));
+    if ops.len() > MAX_WRITES {
+        return Err(invalid(format!("too many writes: at most {MAX_WRITES}")));
     }
     Ok((ops, shape))
 }
@@ -1052,7 +1050,6 @@ async fn apply_writes(
                     old_cid: None,
                 });
                 results.push(serde_json::json!({
-                    "$type": format!("{LEXICON_WRITE_PREFIX}createResult"),
                     "uri": record_uri,
                     "cid": cid,
                 }));
@@ -1112,7 +1109,6 @@ async fn apply_writes(
                     old_cid,
                 });
                 results.push(serde_json::json!({
-                    "$type": format!("{LEXICON_WRITE_PREFIX}updateResult"),
                     "uri": record_uri,
                     "cid": cid,
                 }));
@@ -1162,9 +1158,7 @@ async fn apply_writes(
                     new_cid: None,
                     old_cid: Some(old_cid),
                 });
-                results.push(serde_json::json!({
-                    "$type": format!("{LEXICON_WRITE_PREFIX}deleteResult"),
-                }));
+                results.push(serde_json::json!({}));
             }
         }
     }
@@ -1184,6 +1178,18 @@ async fn apply_writes(
         .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
 
     service::notify_ops(&state, &space, &did, &ops, &rev, committed).await;
+
+    // The lexicons' results name their type; HappyView's earlier ones don't.
+    if shape == WritesShape::Lexicon {
+        for (result, op) in results.iter_mut().zip(&ops) {
+            let kind = match op.action {
+                OplogAction::Create => "createResult",
+                OplogAction::Update => "updateResult",
+                OplogAction::Delete => "deleteResult",
+            };
+            result["$type"] = format!("{LEXICON_WRITE_PREFIX}{kind}").into();
+        }
+    }
 
     Ok(Json(serde_json::json!({
         "results": results,

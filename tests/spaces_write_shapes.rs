@@ -217,6 +217,10 @@ async fn apply_writes_keeps_the_action_tag() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["results"][0]["uri"].is_string(), "{body}");
+    assert!(
+        body["results"][0].get("$type").is_none(),
+        "the earlier shape's results are as they were: {body}"
+    );
 
     // HappyView's earlier update creates a missing record, and deleting one is
     // a 404, as before.
@@ -397,28 +401,38 @@ async fn a_malformed_write_is_invalid_request() {
 
 #[tokio::test]
 #[serial]
-async fn a_lexicon_batch_is_capped() {
+async fn a_batch_is_capped_at_200_writes_in_either_shape() {
     common::require_db!();
     let (app, space, author) = setup("cap").await;
-    let writes = |n: usize| -> Vec<Value> {
+    let writes = |n: usize, tag: &dyn Fn() -> (&'static str, &'static str)| -> Vec<Value> {
         (0..n)
-            .map(|i| json!({ "$type": CREATE, "collection": COLLECTION, "rkey": format!("k{i}"), "value": record("x") }))
+            .map(|i| {
+                let (key, value) = tag();
+                let mut w = json!({ "collection": COLLECTION, "rkey": format!("k{i}"), "value": record("x") });
+                w[key] = value.into();
+                w
+            })
             .collect()
     };
+    let lexicon = || ("$type", CREATE);
+    let action = || ("action", "create");
+    for (label, tag) in [("$type", &lexicon as &dyn Fn() -> _), ("action", &action)] {
+        let (status, body) = post(
+            &app,
+            &author,
+            "applyWrites",
+            json!({ "space": space, "writes": writes(201, tag) }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {body}");
+        assert_eq!(body["error"], "InvalidRequest", "{label}: {body}");
+    }
+    assert!(rkeys(&app, &author, &space).await.is_empty());
     let (status, body) = post(
         &app,
         &author,
         "applyWrites",
-        json!({ "space": space, "writes": writes(201) }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"], "InvalidRequest", "{body}");
-    let (status, body) = post(
-        &app,
-        &author,
-        "applyWrites",
-        json!({ "space": space, "writes": writes(200) }),
+        json!({ "space": space, "writes": writes(200, &lexicon) }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
