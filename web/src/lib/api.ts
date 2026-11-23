@@ -1,5 +1,6 @@
 import type { LimitReached } from "@/types/limits";
 import { parseLimitReached } from "@/lib/limits";
+import { sendsJson } from "@/lib/json-request";
 import type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
 import type { StatsResponse } from "@/types/stats";
 import type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
@@ -225,11 +226,7 @@ async function apiFetch<T = unknown>(
   options?: RequestInit,
 ): Promise<T> {
   const headers: Record<string, string> = {};
-  if (
-    options?.method === "POST" ||
-    options?.method === "PUT" ||
-    options?.method === "PATCH"
-  ) {
+  if (sendsJson(options)) {
     headers["Content-Type"] = "application/json";
   }
 
