@@ -412,7 +412,10 @@ async fn list_repo_ops_since_is_exclusive_and_works_with_a_cursor() {
         revs[1..].to_vec(),
         "since excludes its own rev"
     );
-    assert!(!body["commit"].is_null(), "{body}");
+    // The lexicons' commit, whatever model the repo's state holds.
+    assert_eq!(body["commit"]["repo"], author.as_str(), "{body}");
+    assert_eq!(body["commit"]["space"], space.as_str(), "{body}");
+    assert!(body["commit"]["data"]["$bytes"].is_string(), "{body}");
 
     // Paging from a cursor that is past since keeps paging.
     let (_, page1) = get(
@@ -983,7 +986,7 @@ async fn only_a_writing_member_can_clear() {
 
 #[tokio::test]
 #[serial]
-async fn get_blob_by_repo_answers_an_outsider_the_same_whatever_the_blob() {
+async fn get_blob_by_repo_answers_a_member_who_cannot_read_it_the_same_whatever_the_blob() {
     common::require_db!();
     let (app, space, _authority, author) = setup("blobauth").await;
     let cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
@@ -1004,7 +1007,36 @@ async fn get_blob_by_repo_answers_an_outsider_the_same_whatever_the_blob() {
     .await;
     assert!(status.is_success(), "{status} {body}");
 
+    // A member who may read only their own repo: past the membership check,
+    // short of reading the author's repo.
     let outsider = rand_did("blobauth");
+    let skey = space.rsplit('/').next().unwrap();
+    let authority = space.trim_start_matches("at://").split('/').next().unwrap();
+    let row = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        authority,
+        TYPE_NSID,
+        skey,
+    )
+    .await
+    .unwrap()
+    .expect("the space");
+    spaces_db::add_member(
+        &app.state.db,
+        app.state.db_backend,
+        &SpaceMember {
+            id: Uuid::new_v4().to_string(),
+            space_id: row.id.clone(),
+            did: outsider.clone(),
+            access: MemberAccess::READ_SELF,
+            is_delegation: false,
+            granted_by: None,
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
     let (referenced, a) = get(
         &app,
         &outsider,
