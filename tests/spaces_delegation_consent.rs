@@ -303,7 +303,7 @@ async fn consented(app: &TestApp, space_id: &str, reference: &str) -> bool {
 
 /// Putting an entry that already brings in members again, unchanged, keeps it
 /// without the named space's administrator: a client re-sending its whole
-/// member list goes on working. Changing its access, or naming another space,
+/// member list goes on working. Raising its access, or naming another space,
 /// needs that administrator.
 #[tokio::test]
 #[serial]
@@ -331,7 +331,7 @@ async fn putting_a_consented_entry_again_unchanged_keeps_it() {
     assert!(consented(&app, &x, &y_addr).await);
     assert!(is_member(&app, &x, &y_member).await);
 
-    // A change of access needs Y's administrator; the entry is left as it was.
+    // Raising its access needs Y's administrator; the entry is left as it was.
     let (status, body) = post(
         &app,
         &x_owner,
@@ -557,14 +557,45 @@ async fn keeping_consent_needs_it_at_write_time() {
     assert!(keep(delegation(&x, &y_addr)).await);
     assert!(!consented(&app, &x, &y_addr).await);
 
-    // A consented entry, unchanged, keeps it; with other access, loses it.
+    // A consented entry, unchanged or lowered, keeps it; raised, loses it.
     add_consented(&app, &x, &y_addr, &y).await;
     assert!(keep(delegation(&x, &y_addr)).await);
     assert!(consented(&app, &x, &y_addr).await);
-    let mut changed = delegation(&x, &y_addr);
+    let mut lowered = delegation(&x, &y_addr);
+    lowered.access = MemberAccess {
+        read: false,
+        write: false,
+        read_self: false,
+    };
+    assert!(keep(lowered.clone()).await);
+    assert!(consented(&app, &x, &y_addr).await);
+    let mut changed = lowered;
     changed.access = MemberAccess::WRITE;
     assert!(keep(changed).await);
     assert!(!consented(&app, &x, &y_addr).await);
+
+    // Raising one flag alone loses it too.
+    for (stored, raised) in [
+        (MemberAccess::READ, MemberAccess::WRITE),
+        (
+            MemberAccess {
+                read: false,
+                write: true,
+                read_self: false,
+            },
+            MemberAccess::WRITE,
+        ),
+    ] {
+        let (x, _) = create_space(&app, &owner).await;
+        add_consented_with(&app, &x, &y_addr, &y, stored).await;
+        let mut changed = delegation(&x, &y_addr);
+        changed.access = raised;
+        assert!(keep(changed).await);
+        assert!(
+            !consented(&app, &x, &y_addr).await,
+            "{stored:?} to {raised:?}"
+        );
+    }
 }
 
 /// How many spaces `space_id` nests.
@@ -739,8 +770,12 @@ async fn an_older_entry_changes_in_place() {
     assert!(row.access.read && row.access.write);
     assert!(consented(&app, &x, &y_addr).await);
 
-    // The named space's members keep their own access, as they always did.
-    assert!(is_member(&app, &x, &y_member).await);
+    // The named space's member reads there, and gains no write: the entry
+    // grants at most what the member has in the named space.
+    assert_eq!(
+        access_of(&app, &x, &y_member).await,
+        Some(MemberAccess::READ)
+    );
 }
 
 /// A member named by a space's address is a space-as-member entry unless the
@@ -778,4 +813,334 @@ async fn a_space_address_named_without_is_delegation_is_an_entry() {
             "{nsid} {explicit:?}"
         );
     }
+}
+
+/// A member row stored directly with `access`.
+async fn add_row_with(app: &TestApp, space_id: &str, did: &str, access: MemberAccess) {
+    spaces_db::add_member(
+        &app.state.db,
+        app.state.db_backend,
+        &SpaceMember {
+            access,
+            is_delegation: false,
+            ..delegation(space_id, did)
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// [`add_consented`] with the entry granting `access`.
+async fn add_consented_with(
+    app: &TestApp,
+    space_id: &str,
+    reference: &str,
+    target: &str,
+    access: MemberAccess,
+) {
+    assert!(
+        spaces_db::insert_delegation_if_allowed(
+            &app.state.db,
+            app.state.db_backend,
+            &SpaceMember {
+                access,
+                ..delegation(space_id, reference)
+            },
+            spaces_db::DelegationConsent::Granted(target),
+        )
+        .await
+        .unwrap()
+    );
+}
+
+/// The access `did` has to the space, as access checks resolve it.
+async fn access_of(app: &TestApp, space_id: &str, did: &str) -> Option<MemberAccess> {
+    happyview::spaces::members::is_member(&app.state.db, app.state.db_backend, space_id, did)
+        .await
+        .unwrap()
+}
+
+/// `did`'s read and write as `listMembers` answers them.
+async fn listed_access(app: &TestApp, actor: &str, address: &str, did: &str) -> (Value, Value) {
+    let (name, value) = common::auth::admin_cookie_header(actor, &app.state.cookie_key);
+    let req = Request::builder()
+        .uri(format!(
+            "/xrpc/com.atproto.simplespace.listMembers?space={}",
+            urlencoding::encode(address)
+        ))
+        .header(name, value)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let member = body["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["did"] == json!(did))
+        .unwrap_or_else(|| panic!("{did} listed"))
+        .clone();
+    (member["read"].clone(), member["write"].clone())
+}
+
+const READ_ONLY: MemberAccess = MemberAccess::READ;
+const READ_WRITE: MemberAccess = MemberAccess::WRITE;
+const WRITE_ONLY: MemberAccess = MemberAccess {
+    read: false,
+    write: true,
+    read_self: false,
+};
+
+/// A member brought in through an entry gets the lesser of their own access
+/// in the named space and the entry's: a read-only entry grants a member who
+/// reads and writes there only read, and a write-only entry grants no read.
+#[tokio::test]
+#[serial]
+async fn an_entry_grants_its_members_no_more_than_its_own_access() {
+    common::require_db!();
+    let app = setup().await;
+    let (owner, member) = (rand_did("o"), rand_did("m"));
+    let (y, y_addr) = create_space(&app, &owner).await;
+    add_row_with(&app, &y, &member, READ_WRITE).await;
+
+    for (entry, expected) in [
+        (READ_ONLY, READ_ONLY),
+        (WRITE_ONLY, WRITE_ONLY),
+        (READ_WRITE, READ_WRITE),
+    ] {
+        let (x, x_addr) = create_space(&app, &owner).await;
+        add_consented_with(&app, &x, &y_addr, &y, entry).await;
+        assert_eq!(
+            access_of(&app, &x, &member).await,
+            Some(expected),
+            "{entry:?}"
+        );
+        assert_eq!(
+            listed_access(&app, &owner, &x_addr, &member).await,
+            (json!(expected.read), json!(expected.write)),
+            "{entry:?}"
+        );
+    }
+
+    // A member who only reads the named space gains no write from an entry
+    // that grants it.
+    let reader = rand_did("r");
+    add_row_with(&app, &y, &reader, READ_ONLY).await;
+    let (x, _) = create_space(&app, &owner).await;
+    add_consented_with(&app, &x, &y_addr, &y, READ_WRITE).await;
+    assert_eq!(access_of(&app, &x, &reader).await, Some(READ_ONLY));
+}
+
+/// The cap applies at every entry on the way: X naming Y naming Z gives Z's
+/// members at most what both entries grant.
+#[tokio::test]
+#[serial]
+async fn entries_cap_their_members_at_every_level() {
+    common::require_db!();
+    let app = setup().await;
+    let (owner, member) = (rand_did("o"), rand_did("m"));
+    let (z, z_addr) = create_space(&app, &owner).await;
+    add_row_with(&app, &z, &member, READ_WRITE).await;
+
+    for (x_to_y, y_to_z, expected) in [
+        (READ_ONLY, READ_WRITE, READ_ONLY),
+        (READ_WRITE, READ_ONLY, READ_ONLY),
+        (READ_WRITE, WRITE_ONLY, WRITE_ONLY),
+        (
+            WRITE_ONLY,
+            READ_ONLY,
+            MemberAccess {
+                read: false,
+                write: false,
+                read_self: false,
+            },
+        ),
+        (READ_WRITE, READ_WRITE, READ_WRITE),
+    ] {
+        let (y, y_addr) = create_space(&app, &owner).await;
+        add_consented_with(&app, &y, &z_addr, &z, y_to_z).await;
+        let (x, _) = create_space(&app, &owner).await;
+        add_consented_with(&app, &x, &y_addr, &y, x_to_y).await;
+        assert_eq!(
+            access_of(&app, &x, &member).await,
+            Some(expected),
+            "{x_to_y:?} then {y_to_z:?}"
+        );
+    }
+
+    // Reached through two entries, the member gets the most either grants.
+    let (y1, y1_addr) = create_space(&app, &owner).await;
+    add_consented_with(&app, &y1, &z_addr, &z, READ_ONLY).await;
+    let (y2, y2_addr) = create_space(&app, &owner).await;
+    add_consented_with(&app, &y2, &z_addr, &z, WRITE_ONLY).await;
+    let (x, _) = create_space(&app, &owner).await;
+    add_consented_with(&app, &x, &y1_addr, &y1, READ_WRITE).await;
+    add_consented_with(&app, &x, &y2_addr, &y2, READ_WRITE).await;
+    assert_eq!(access_of(&app, &x, &member).await, Some(READ_WRITE));
+}
+
+/// A path that grants no read doesn't lift an own-records-only restriction
+/// another path sets: a member who reads only their own records here
+/// directly, and reaches the space again through a write-only entry, writes
+/// and still reads only their own records.
+#[tokio::test]
+#[serial]
+async fn a_write_only_entry_keeps_a_direct_members_own_records_restriction() {
+    common::require_db!();
+    let app = setup().await;
+    let (owner, member) = (rand_did("o"), rand_did("m"));
+    let (y, y_addr) = create_space(&app, &owner).await;
+    add_row_with(&app, &y, &member, READ_WRITE).await;
+    let (x, _) = create_space(&app, &owner).await;
+    add_row_with(&app, &x, &member, MemberAccess::READ_SELF).await;
+    add_consented_with(&app, &x, &y_addr, &y, WRITE_ONLY).await;
+    assert_eq!(
+        access_of(&app, &x, &member).await,
+        Some(MemberAccess {
+            read: true,
+            write: true,
+            read_self: true,
+        })
+    );
+}
+
+/// A nested reference stored straight into the store, in `space_id`,
+/// naming the space `target` at `address`.
+async fn add_nested(
+    app: &TestApp,
+    space_id: &str,
+    target: &str,
+    address: &str,
+    access: MemberAccess,
+) {
+    spaces_db::upsert_nested(
+        &app.state.db,
+        app.state.db_backend,
+        space_id,
+        target,
+        &spaces_db::NestedRef {
+            target_space_uri: address.to_string(),
+            read: access.read,
+            write: access.write,
+            added_by: None,
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Entries and nested references cap each other along a path, whichever
+/// comes first.
+#[tokio::test]
+#[serial]
+async fn entries_and_nested_spaces_cap_each_other() {
+    common::require_db!();
+    let app = setup().await;
+    let (owner, member) = (rand_did("o"), rand_did("m"));
+    let (z, z_addr) = create_space(&app, &owner).await;
+    add_row_with(&app, &z, &member, READ_WRITE).await;
+
+    for (nested_first, outer, inner, expected) in [
+        (true, READ_WRITE, READ_ONLY, READ_ONLY),
+        (true, READ_ONLY, READ_WRITE, READ_ONLY),
+        (true, READ_WRITE, WRITE_ONLY, WRITE_ONLY),
+        (false, READ_WRITE, READ_ONLY, READ_ONLY),
+        (false, READ_ONLY, READ_WRITE, READ_ONLY),
+        (false, WRITE_ONLY, READ_WRITE, WRITE_ONLY),
+    ] {
+        let (y, y_addr) = create_space(&app, &owner).await;
+        let (x, _) = create_space(&app, &owner).await;
+        if nested_first {
+            // X nests Y, which lists Z.
+            add_consented_with(&app, &y, &z_addr, &z, inner).await;
+            add_nested(&app, &x, &y, &y_addr, outer).await;
+        } else {
+            // X lists Y, which nests Z.
+            add_nested(&app, &y, &z, &z_addr, inner).await;
+            add_consented_with(&app, &x, &y_addr, &y, outer).await;
+        }
+        assert_eq!(
+            access_of(&app, &x, &member).await,
+            Some(expected),
+            "nested first: {nested_first}, {outer:?} then {inner:?}"
+        );
+    }
+}
+
+/// The delegating space's administrator may lower what a consented entry
+/// grants, to no access at all, without the named space's administrator, and
+/// the entry keeps its consent. Raising either flag needs the named space's
+/// administrator, even alongside lowering the other.
+#[tokio::test]
+#[serial]
+async fn the_delegating_admin_alone_may_lower_an_entry_but_not_raise_it() {
+    common::require_db!();
+    let app = setup().await;
+    let (x_owner, y_owner, member) = (rand_did("x"), rand_did("y"), rand_did("m"));
+    let (y, y_addr) = create_space(&app, &y_owner).await;
+    add_row_with(&app, &y, &member, READ_WRITE).await;
+    let none = MemberAccess {
+        read: false,
+        write: false,
+        read_self: false,
+    };
+    let put = |space: &str, read: bool, write: bool| json!({ "space": space, "did": y_addr, "read": read, "write": write, "isDelegation": true });
+    let entry = |app: &TestApp, x: String| {
+        let (db, backend, y_addr) = (app.state.db.clone(), app.state.db_backend, y_addr.clone());
+        async move {
+            spaces_db::get_member(&db, backend, &x, &y_addr)
+                .await
+                .unwrap()
+                .unwrap()
+                .access
+        }
+    };
+
+    let (x, x_addr) = create_space(&app, &x_owner).await;
+    add_consented_with(&app, &x, &y_addr, &y, READ_WRITE).await;
+    for (read, write, expected) in [(true, false, READ_ONLY), (false, false, none)] {
+        let (status, body) = post(
+            &app,
+            &x_owner,
+            "com.atproto.simplespace.putMember",
+            put(&x_addr, read, write),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "lower to {read}/{write}: {body}"
+        );
+        assert!(consented(&app, &x, &y_addr).await, "{read}/{write}");
+        assert_eq!(access_of(&app, &x, &member).await, Some(expected));
+    }
+    // Raising it back needs Y's administrator.
+    let (status, body) = post(
+        &app,
+        &x_owner,
+        "com.atproto.simplespace.putMember",
+        put(&x_addr, true, false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "raise: {body}");
+    assert_eq!(entry(&app, x.clone()).await, none);
+    assert!(consented(&app, &x, &y_addr).await);
+
+    // Lowering read while raising write is a raise.
+    let (x, x_addr) = create_space(&app, &x_owner).await;
+    add_consented_with(&app, &x, &y_addr, &y, READ_ONLY).await;
+    let (status, body) = post(
+        &app,
+        &x_owner,
+        "com.atproto.simplespace.putMember",
+        put(&x_addr, false, true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "mixed: {body}");
+    assert_eq!(entry(&app, x.clone()).await, READ_ONLY);
+    assert!(consented(&app, &x, &y_addr).await);
+    assert_eq!(access_of(&app, &x, &member).await, Some(READ_ONLY));
 }

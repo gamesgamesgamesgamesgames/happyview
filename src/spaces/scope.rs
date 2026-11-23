@@ -122,6 +122,20 @@ mod tests {
         let merged = MemberAccess::READ.union(MemberAccess::WRITE);
         assert!(merged.can_write());
     }
+
+    #[test]
+    fn union_with_a_path_that_reads_nothing_keeps_read_self() {
+        let write_only = MemberAccess {
+            read: false,
+            write: true,
+            read_self: false,
+        };
+        let merged = MemberAccess::READ_SELF.union(write_only);
+        assert!(merged.can_read() && merged.can_write());
+        assert!(merged.restricted_to_own_records());
+        let merged = write_only.union(MemberAccess::READ_SELF);
+        assert!(merged.restricted_to_own_records());
+    }
 }
 
 // ---------------------------------------------------------------------------

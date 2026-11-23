@@ -495,10 +495,10 @@ pub enum DelegationConsent<'a> {
     /// It brings in the members of the space with this id, whose
     /// administrator the caller has checked is adding it.
     Granted(&'a str),
-    /// It stays as stored, if the stored entry already brings in members
-    /// and its access is unchanged; otherwise it brings in none. Decided in
-    /// the write itself, so a concurrent change cannot be overwritten with
-    /// consent.
+    /// It keeps the stored entry's consent, if that entry already brings in
+    /// members and the new access raises neither flag; otherwise it brings
+    /// in none. Decided in the write itself, so a concurrent change cannot
+    /// be overwritten with consent.
     Kept,
 }
 
@@ -508,12 +508,12 @@ pub(crate) async fn upsert_member(
     member: &SpaceMember,
     consent: DelegationConsent<'_>,
 ) -> Result<(), sqlx::Error> {
-    // The stored entry, unchanged: already consented, still an entry, and
-    // the same read and write.
+    // The stored entry, not raised: already consented, still an entry, and
+    // no read or write it didn't already grant.
     const KEEP: &str = "happyview_space_members.delegation_consented = 1 \
          AND happyview_space_members.is_delegation = 1 AND excluded.is_delegation = 1 \
-         AND happyview_space_members.can_read = excluded.can_read \
-         AND happyview_space_members.can_write = excluded.can_write";
+         AND excluded.can_read <= happyview_space_members.can_read \
+         AND excluded.can_write <= happyview_space_members.can_write";
     let (values, on_conflict) = match consent {
         DelegationConsent::None => (
             "0, NULL".to_string(),
