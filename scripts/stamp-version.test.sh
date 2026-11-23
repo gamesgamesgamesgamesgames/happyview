@@ -14,8 +14,10 @@ check_stamped() {
         || { echo "Cargo.toml was not stamped with $1" >&2; exit 1; }
     grep -A1 -x 'name = "happyview"' "$work/Cargo.lock" | grep -qx "version = \"$1\"" \
         || { echo "Cargo.lock was not stamped with $1" >&2; exit 1; }
-    # Only the package's own entry moves.
-    test "$(grep -c "version = \"$1\"" "$work/Cargo.lock")" = 1 \
+    # Only the package's own entry moves. Compared line by line against the
+    # real lockfile, not by counting the new version: a dependency can
+    # already be at that version (form_urlencoded is 1.2.3).
+    test "$(diff "$root/Cargo.lock" "$work/Cargo.lock" | grep -c '^>')" = 1 \
         || { echo "Cargo.lock: more than one entry changed" >&2; exit 1; }
 }
 
