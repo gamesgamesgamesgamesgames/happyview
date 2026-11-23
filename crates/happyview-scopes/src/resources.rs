@@ -623,6 +623,12 @@ pub struct SpacePermission {
     pub manage: Vec<ManageOp>,
 }
 
+/// Whether a scope token is a `space` scope, in any of its forms:
+/// `space:<type>…` or `space?spaceType=…`.
+pub fn is_space_scope(token: &str) -> bool {
+    token == "space" || token.starts_with("space:") || token.starts_with("space?")
+}
+
 impl SpacePermission {
     pub fn parse(scope: &str) -> Option<Self> {
         let syntax = ScopeSyntax::parse(scope);
@@ -631,15 +637,29 @@ impl SpacePermission {
         }
         if !has_only_known_keys(
             &syntax,
-            &["authority", "skey", "collection", "action", "manage"],
+            &[
+                "spaceType",
+                "type",
+                "authority",
+                "skey",
+                "collection",
+                "action",
+                "manage",
+            ],
         ) {
             return None;
         }
-        if positional_conflicts(&syntax, "type") {
-            return None;
-        }
-
-        let space_type = syntax.positional.clone()?;
+        // The space type is positional (`space:<type>`) or named: `spaceType`
+        // since the Nov 12 text, `type` before it. Naming it twice is refused.
+        let named_type = |key| syntax.get_single(key).ok().map(|v| v.map(str::to_string));
+        let space_type = match (
+            syntax.positional.clone(),
+            named_type("spaceType")?,
+            named_type("type")?,
+        ) {
+            (Some(t), None, None) | (None, Some(t), None) | (None, None, Some(t)) => t,
+            _ => return None,
+        };
         let multi = |key: &str| {
             syntax
                 .get_multi(key)
@@ -998,6 +1018,38 @@ mod space_tests {
         assert!(p.collection.is_empty());
         // An ordinary record grant confers nothing administrative.
         assert!(p.manage.is_empty());
+    }
+
+    #[test]
+    fn the_space_type_may_be_named() {
+        let positional = SpacePermission::parse("space:com.example.forum?authority=*").unwrap();
+        for named in [
+            "space?spaceType=com.example.forum&authority=*",
+            "space?type=com.example.forum&authority=*",
+        ] {
+            assert_eq!(
+                SpacePermission::parse(named),
+                Some(positional.clone()),
+                "{named}"
+            );
+        }
+        for twice in [
+            "space:com.example.forum?spaceType=com.example.forum",
+            "space:com.example.forum?type=com.example.forum",
+            "space?spaceType=com.example.forum&type=com.example.forum",
+            "space?spaceType=com.example.forum&spaceType=com.example.other",
+        ] {
+            assert!(SpacePermission::parse(twice).is_none(), "{twice}");
+        }
+        assert!(SpacePermission::parse("space?authority=*").is_none());
+    }
+
+    #[test]
+    fn a_space_scope_is_recognised_in_either_form() {
+        assert!(is_space_scope("space:com.example.forum"));
+        assert!(is_space_scope("space?spaceType=com.example.forum"));
+        assert!(!is_space_scope("spaces:read"));
+        assert!(!is_space_scope("repo:com.example.post"));
     }
 
     #[test]

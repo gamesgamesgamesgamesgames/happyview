@@ -56,7 +56,10 @@ async fn enqueue_space_migrations(state: &AppState, did: &str) {
             return;
         }
     };
-    if !scope.split_whitespace().any(|s| s.starts_with("space:")) {
+    if !scope
+        .split_whitespace()
+        .any(happyview_scopes::is_space_scope)
+    {
         return;
     }
 
@@ -119,7 +122,7 @@ async fn drop_space_scopes_if_unsupported(
 
 fn is_space_scope(scope: &Scope) -> bool {
     match scope {
-        Scope::Unknown(value) => value == "space" || value.starts_with("space:"),
+        Scope::Unknown(value) => happyview_scopes::is_space_scope(value),
         _ => false,
     }
 }

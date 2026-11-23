@@ -457,7 +457,7 @@ fn is_handle(s: &str) -> bool {
         .is_match(s)
 }
 
-fn is_record_key(s: &str) -> bool {
+pub(crate) fn is_record_key(s: &str) -> bool {
     static RKEY: OnceLock<Regex> = OnceLock::new();
     s != "." && s != ".." && regex(&RKEY, r"^[a-zA-Z0-9_~.:-]{1,512}$").is_match(s)
 }

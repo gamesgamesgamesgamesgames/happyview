@@ -243,7 +243,11 @@ struct GetSpaceCredentialInput {
 #[serde(rename_all = "camelCase")]
 struct CreateRecordInput {
     space: String,
+    /// The lexicons' repo, which must be the caller's.
+    repo: Option<String>,
     collection: String,
+    /// A key the caller chose; a TID when omitted.
+    rkey: Option<String>,
     record: serde_json::Value,
 }
 
@@ -258,8 +262,103 @@ struct GetSpaceBlobQuery {
 #[serde(rename_all = "camelCase")]
 struct ApplyWritesInput {
     space: String,
+    /// The lexicons' repo, which must be the caller's. Optional, as HappyView's
+    /// earlier routes took none.
+    repo: Option<String>,
     swap_commit: Option<String>,
-    writes: Vec<WriteOp>,
+    /// Read by [`parse_writes`]: each tagged by `action` (HappyView's earlier
+    /// shape) or by the lexicons' `$type` union.
+    writes: Vec<serde_json::Value>,
+}
+
+/// How an `applyWrites` request tags its writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WritesShape {
+    /// `action: create | update | delete`, HappyView's earlier shape. An update
+    /// of a missing record creates it, and deleting one is a 404.
+    Action,
+    /// The lexicons' `$type` union (`com.atproto.space.applyWrites#create`,
+    /// …). Updating or deleting a missing record is `RecordNotFound`, as the
+    /// lexicons have it.
+    Lexicon,
+}
+
+const LEXICON_WRITE_PREFIX: &str = "com.atproto.space.applyWrites#";
+
+/// The most writes one lexicon-shaped `applyWrites` takes, as the reference.
+const MAX_LEXICON_WRITES: usize = 200;
+
+/// Read a batch's writes, in either shape. A batch is one shape throughout.
+fn parse_writes(writes: Vec<serde_json::Value>) -> Result<(Vec<WriteOp>, WritesShape), AppError> {
+    let invalid = |message: String| bad_request("InvalidRequest", message);
+    let mut shape = None;
+    let mut ops = Vec::with_capacity(writes.len());
+    for (i, mut write) in writes.into_iter().enumerate() {
+        let this = match write.get("$type").and_then(|t| t.as_str()) {
+            Some(type_) => {
+                let action = match type_.strip_prefix(LEXICON_WRITE_PREFIX) {
+                    Some(action @ ("create" | "update" | "delete")) => action.to_string(),
+                    _ => return Err(invalid(format!("writes[{i}]: unknown write type {type_}"))),
+                };
+                if let Some(obj) = write.as_object_mut() {
+                    obj.remove("$type");
+                    obj.insert("action".into(), action.into());
+                }
+                WritesShape::Lexicon
+            }
+            None => WritesShape::Action,
+        };
+        if *shape.get_or_insert(this) != this {
+            return Err(invalid(
+                "writes are tagged two ways; tag them all by $type, or all by action".into(),
+            ));
+        }
+        ops.push(
+            serde_json::from_value::<WriteOp>(write)
+                .map_err(|e| invalid(format!("writes[{i}]: {e}")))?,
+        );
+    }
+    let shape = shape.unwrap_or(WritesShape::Action);
+    if shape == WritesShape::Lexicon && ops.len() > MAX_LEXICON_WRITES {
+        return Err(invalid(format!(
+            "too many writes: at most {MAX_LEXICON_WRITES}"
+        )));
+    }
+    Ok((ops, shape))
+}
+
+/// A record key the caller chose, checked as the lexicons' `record-key`.
+fn check_rkey(rkey: &str) -> Result<(), AppError> {
+    if crate::xrpc::validate::is_record_key(rkey) {
+        Ok(())
+    } else {
+        Err(bad_request(
+            "InvalidRequest",
+            format!("{rkey:?} is not a valid record key"),
+        ))
+    }
+}
+
+fn record_already_exists(collection: &str, rkey: &str) -> AppError {
+    bad_request(
+        "RecordAlreadyExists",
+        format!("Record already exists: {collection}/{rkey}"),
+    )
+}
+
+fn record_not_found(collection: &str, rkey: &str) -> AppError {
+    bad_request(
+        "RecordNotFound",
+        format!("Record not found: {collection}/{rkey}"),
+    )
+}
+
+fn bad_request(code: &'static str, message: String) -> AppError {
+    AppError::XrpcError {
+        status: StatusCode::BAD_REQUEST,
+        code,
+        message,
+    }
 }
 
 #[derive(Deserialize)]
@@ -712,7 +811,15 @@ async fn create_record(
     xrpc_claims: XrpcClaims,
     Json(input): Json<CreateRecordInput>,
 ) -> Result<Response, AppError> {
+    if let Some(rkey) = input.rkey.as_deref() {
+        check_rkey(rkey)?;
+    }
     let did = require_auth_or_credential(&state, &xrpc_claims).await?;
+    if input.repo.as_deref().is_some_and(|repo| repo != did) {
+        return Err(AppError::Forbidden(
+            "repo must be the authenticated account".into(),
+        ));
+    }
     authorize_space_write(
         &state,
         &xrpc_claims,
@@ -721,12 +828,13 @@ async fn create_record(
         happyview_scopes::SpaceAction::Create,
     )
     .await?;
-    let (uri, cid) = service::create_record(
+    let (uri, cid) = service::create_record_at(
         &state,
         &did,
         xrpc_claims.space_credential.as_deref(),
         &input.space,
         &input.collection,
+        input.rkey.as_deref(),
         input.record,
     )
     .await?;
@@ -803,8 +911,24 @@ async fn apply_writes(
     xrpc_claims: XrpcClaims,
     Json(input): Json<ApplyWritesInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let (writes, shape) = parse_writes(input.writes)?;
     let did = require_auth_or_credential(&state, &xrpc_claims).await?;
-    for write in &input.writes {
+    if input.repo.as_deref().is_some_and(|repo| repo != did) {
+        return Err(AppError::Forbidden(
+            "repo must be the authenticated account".into(),
+        ));
+    }
+    for write in &writes {
+        if let WriteOp::Create {
+            rkey: Some(rkey), ..
+        }
+        | WriteOp::Update { rkey, .. }
+        | WriteOp::Delete { rkey, .. } = write
+        {
+            check_rkey(rkey)?;
+        }
+    }
+    for write in &writes {
         let (WriteOp::Create { collection, .. }
         | WriteOp::Update { collection, .. }
         | WriteOp::Delete { collection, .. }) = write;
@@ -824,7 +948,7 @@ async fn apply_writes(
     // collection must not carry a write to another just because they arrived
     // together.
     if let Some(identity) = xrpc_claims.identity.as_ref() {
-        for write in &input.writes {
+        for write in &writes {
             let (collection, action) = match write {
                 WriteOp::Create { collection, .. } => {
                     (collection, happyview_scopes::SpaceAction::Create)
@@ -858,12 +982,7 @@ async fn apply_writes(
         &space,
         &did,
         "com.atproto.space.applyWrites",
-        pds_apply_writes_body(
-            &space_uri,
-            &did,
-            input.swap_commit.as_deref(),
-            &input.writes,
-        ),
+        pds_apply_writes_body(&space_uri, &did, input.swap_commit.as_deref(), &writes),
     )
     .await?
     {
@@ -882,9 +1001,9 @@ async fn apply_writes(
         }
     }
 
-    let mut results = Vec::with_capacity(input.writes.len());
+    let mut results = Vec::with_capacity(writes.len());
     let rev = generate_tid();
-    let mut ops: Vec<service::AppliedOp> = Vec::with_capacity(input.writes.len());
+    let mut ops: Vec<service::AppliedOp> = Vec::with_capacity(writes.len());
 
     // Resolve the signing key before opening the transaction: provisioning the
     // `#atproto_space` key writes, and doing that on a second connection while a
@@ -893,7 +1012,7 @@ async fn apply_writes(
 
     let mut tx = service::begin_space_write(&state, &space.id).await?;
 
-    for op in input.writes {
+    for op in writes {
         match op {
             WriteOp::Create {
                 collection,
@@ -906,6 +1025,14 @@ async fn apply_writes(
                     "at://{}/space/{}/{}/{}/{}/{}",
                     space.did, space.type_nsid, space.skey, did, collection, rkey
                 );
+                // Read inside the batch, so a create after a create of the
+                // same key is refused too.
+                if db::get_space_record(&mut *tx, state.db_backend, &record_uri)
+                    .await?
+                    .is_some()
+                {
+                    return Err(record_already_exists(&collection, &rkey));
+                }
                 let record = SpaceRecord {
                     uri: record_uri.clone(),
                     space_id: space.id.clone(),
@@ -925,6 +1052,7 @@ async fn apply_writes(
                     old_cid: None,
                 });
                 results.push(serde_json::json!({
+                    "$type": format!("{LEXICON_WRITE_PREFIX}createResult"),
                     "uri": record_uri,
                     "cid": cid,
                 }));
@@ -956,6 +1084,11 @@ async fn apply_writes(
                         .await?
                         .map(|r| r.cid),
                 };
+                // The lexicons' update needs the record to exist; HappyView's
+                // earlier one creates it.
+                if shape == WritesShape::Lexicon && old_cid.is_none() {
+                    return Err(record_not_found(&collection, &rkey));
+                }
                 if let Some(swap_cid) = swap_record {
                     db::upsert_space_record_with_swap(
                         &mut tx,
@@ -979,6 +1112,7 @@ async fn apply_writes(
                     old_cid,
                 });
                 results.push(serde_json::json!({
+                    "$type": format!("{LEXICON_WRITE_PREFIX}updateResult"),
                     "uri": record_uri,
                     "cid": cid,
                 }));
@@ -1012,6 +1146,9 @@ async fn apply_writes(
                                 "You can only delete your own records".into(),
                             ));
                         }
+                        None if shape == WritesShape::Lexicon => {
+                            return Err(record_not_found(&collection, &rkey));
+                        }
                         None => return Err(AppError::NotFound("Record not found".into())),
                         Some(r) => r.cid,
                     };
@@ -1025,7 +1162,9 @@ async fn apply_writes(
                     new_cid: None,
                     old_cid: Some(old_cid),
                 });
-                results.push(serde_json::json!({}));
+                results.push(serde_json::json!({
+                    "$type": format!("{LEXICON_WRITE_PREFIX}deleteResult"),
+                }));
             }
         }
     }
