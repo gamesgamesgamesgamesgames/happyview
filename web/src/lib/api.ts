@@ -150,7 +150,10 @@ async function apiFetch<T = unknown>(
   options?: RequestInit,
 ): Promise<T> {
   const headers: Record<string, string> = {};
+  // Any request with a JSON body, whatever its method: a DELETE can carry
+  // one too. POST, PUT and PATCH keep the header with or without a body.
   if (
+    typeof options?.body === "string" ||
     options?.method === "POST" ||
     options?.method === "PUT" ||
     options?.method === "PATCH"
