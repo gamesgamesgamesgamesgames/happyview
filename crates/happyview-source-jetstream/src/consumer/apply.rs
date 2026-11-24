@@ -22,7 +22,7 @@ use happyview_provider::{
 use tokio::sync::watch;
 
 use super::event::{Commit, CursorPoint, Event, EventKind};
-use super::workers::{ApplyFn, ApplyOutcome, GiveUpFn};
+use super::workers::{ApplyFn, ApplyOutcome, BatchApplyFn, Batching, DEFAULT_BATCH_MAX, GiveUpFn};
 
 /// The worker's `ApplyFn`. `collections` is the registered record
 /// collections; only a `#sync` reads them, so only a `#sync` clones them.
@@ -35,6 +35,62 @@ pub fn apply_fn(host: Arc<dyn Host>, collections: watch::Receiver<Vec<String>>) 
         };
         async move { apply_event(&*host, &tracked, event).await }.boxed()
     })
+}
+
+/// The worker's batching: a run of one DID's record creates goes to the host
+/// as one `ingest_batch`, which writes the records it stores in one
+/// transaction, with one tombstone lookup for the lot, where one event at a
+/// time costs a transaction and a lookup each. Each event's outcome is
+/// judged as [`apply_commit`] judges it, and a batch stops at its first
+/// failure, which the worker then retries one event at a time.
+pub fn batching(host: Arc<dyn Host>) -> Batching {
+    Batching {
+        apply: apply_batch_fn(host),
+        max: DEFAULT_BATCH_MAX,
+    }
+}
+
+fn apply_batch_fn(host: Arc<dyn Host>) -> BatchApplyFn {
+    Arc::new(move |events: Vec<Event>| {
+        let host = Arc::clone(&host);
+        async move { apply_commits(&*host, events).await }.boxed()
+    })
+}
+
+/// Apply a run of commits as one batch: one outcome per event, in order. A
+/// commit the pipeline does not know, or a batch whose outcomes do not line
+/// up with its events, is not applied here; it and everything after it is
+/// reported as not applied, for the worker's one-event path.
+pub async fn apply_commits(host: &dyn Host, events: Vec<Event>) -> Vec<ApplyOutcome> {
+    let mut commits = Vec::with_capacity(events.len());
+    let mut sources = Vec::with_capacity(events.len());
+    for event in events {
+        let EventKind::Commit(commit) = event.kind else {
+            break;
+        };
+        let Some(source) = record_event(&event.did, event.cursor, &commit) else {
+            break;
+        };
+        sources.push(source);
+        commits.push((event.did, event.cursor, commit));
+    }
+    if sources.is_empty() {
+        return Vec::new();
+    }
+    let batch = host.ingest_batch(sources).await;
+    if batch.outcomes.len() != commits.len() {
+        return Vec::new();
+    }
+    let mut outcomes = Vec::with_capacity(commits.len());
+    for ((did, cursor, commit), outcome) in commits.into_iter().zip(batch.outcomes) {
+        let judged = commit_outcome(host, &did, cursor, &commit, outcome).await;
+        let applied = judged == ApplyOutcome::Applied;
+        outcomes.push(judged);
+        if !applied {
+            break;
+        }
+    }
+    outcomes
 }
 
 /// The worker's `GiveUpFn`: logs `jetstream.apply_failed` for an event that
@@ -169,34 +225,50 @@ fn worker_outcome((outcome, error): (IngestOutcome, Option<String>)) -> ApplyOut
     }
 }
 
+/// The live ingest event for `commit`, or `None` for an operation the
+/// pipeline does not know.
+fn record_event(did: &str, cursor: CursorPoint, commit: &Commit) -> Option<SourceEvent> {
+    let action = Action::parse(&commit.operation)?;
+    Some(SourceEvent::Record(RecordEvent {
+        key: RecordKey {
+            did: did.to_string(),
+            collection: commit.collection.clone(),
+            rkey: commit.rkey.clone(),
+        },
+        action,
+        cid: commit.cid.clone(),
+        rev: commit.rev.clone(),
+        body: commit.record.clone(),
+        time_us: Some(cursor.time_us()),
+        origin: Origin::Live,
+        stored: false,
+    }))
+}
+
 async fn apply_commit(
     host: &dyn Host,
     did: String,
     cursor: CursorPoint,
     commit: Commit,
 ) -> ApplyOutcome {
-    let uri = || format!("at://{}/{}/{}", did, commit.collection, commit.rkey);
-    let outcome = match Action::parse(&commit.operation) {
-        Some(action) => {
-            host.ingest(SourceEvent::Record(RecordEvent {
-                key: RecordKey {
-                    did: did.clone(),
-                    collection: commit.collection.clone(),
-                    rkey: commit.rkey.clone(),
-                },
-                action,
-                cid: commit.cid.clone(),
-                rev: commit.rev.clone(),
-                body: commit.record.clone(),
-                time_us: Some(cursor.time_us()),
-                origin: Origin::Live,
-                stored: false,
-            }))
-            .await
-        }
+    let outcome = match record_event(&did, cursor, &commit) {
+        Some(event) => host.ingest(event).await,
         // An operation the pipeline does not know, judged as before.
         None => unknown_operation(host, &commit.collection),
     };
+    commit_outcome(host, &did, cursor, &commit, outcome).await
+}
+
+/// What the worker makes of one commit's ingest outcome: counted, and
+/// logged when invalid, as one event applied on its own would be.
+async fn commit_outcome(
+    host: &dyn Host,
+    did: &str,
+    cursor: CursorPoint,
+    commit: &Commit,
+    outcome: IngestOutcome,
+) -> ApplyOutcome {
+    let uri = || format!("at://{}/{}/{}", did, commit.collection, commit.rkey);
     match outcome {
         IngestOutcome::Matched => {
             host.counters().matched.fetch_add(1, Ordering::Relaxed);
@@ -223,13 +295,13 @@ async fn apply_commit(
         IngestOutcome::Invalid => {
             host.counters().skipped.fetch_add(1, Ordering::Relaxed);
             let uri = uri();
-            let error = invalid_reason(&commit);
+            let error = invalid_reason(commit);
             tracing::warn!(uri, error, "skipping an invalid jetstream commit");
             log(
                 host,
                 "jetstream.record_invalid",
                 Severity::Warn,
-                &did,
+                did,
                 serde_json::json!({ "uri": uri, "seq": cursor.seq(), "error": error }),
             )
             .await;

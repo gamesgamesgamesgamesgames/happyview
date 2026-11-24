@@ -583,12 +583,14 @@ async fn run(
     // One pool and one watermark for the consumer's life, so a DID's events
     // stay in order across reconnects.
     let watermark = Arc::new(WatermarkHandle::new());
-    let pool = WorkerPool::spawn(
+    let pool = WorkerPool::spawn_batched(
         settings.workers,
         WORKER_QUEUE_CAPACITY,
         // A `#sync` purges the streamed (filtered) collections only: one
         // outside them belongs to its executor or to the composing provider.
         apply::apply_fn(Arc::clone(&state.host), collections_rx.clone()),
+        // A DID's run of creates (a re-sent repo, say) is written in batches.
+        Some(apply::batching(Arc::clone(&state.host))),
         Arc::clone(&watermark),
         retry,
         apply::give_up_fn(Arc::clone(&state.host)),
