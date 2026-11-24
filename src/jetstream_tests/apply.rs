@@ -1355,11 +1355,12 @@ async fn the_consumer_pool_batches_creates_and_keeps_their_order() {
         let did = unique_did();
         let (_tx, rx) = tokio::sync::watch::channel(vec![NSID.to_string()]);
         let watermark = Arc::new(WatermarkHandle::new());
+        let (counted, batched) = counting_batching(&state);
         let pool = WorkerPool::spawn_batched(
             2,
             512,
             apply_fn(host(&state), rx),
-            Some(batching(host(&state))),
+            Some(counted),
             Arc::clone(&watermark),
             RetryPolicy::default(),
             give_up_fn(host(&state)),
@@ -1380,11 +1381,114 @@ async fn the_consumer_pool_batches_creates_and_keeps_their_order() {
             .expect("every event applies");
         assert_eq!(watermark.applied().and_then(|p| p.seq()), Some(300));
         drop(pool);
+        // The pool may take the first create alone, before the rest are
+        // queued, but the run behind it goes in batches.
+        let batched = batched.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(batched >= 250, "{batched} events went through a batch");
 
         let rows = rkeys(&state, &did).await;
         assert_eq!(rows.len(), 297, "298 creates, less the one deleted");
         assert!(!rows.contains(&"r00010".to_string()));
         assert!(rows.contains(&"r00300".to_string()));
+        clean_up(&state, &did).await;
+    }
+}
+
+/// The live batching, counting the events that went through a batch.
+fn counting_batching(
+    state: &AppState,
+) -> (
+    happyview_source_jetstream::consumer::workers::Batching,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use futures_util::FutureExt;
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let host = host(state);
+    let apply: happyview_source_jetstream::consumer::workers::BatchApplyFn = {
+        let count = Arc::clone(&count);
+        Arc::new(move |events: Vec<Event>| {
+            count.fetch_add(events.len(), std::sync::atomic::Ordering::SeqCst);
+            let host = Arc::clone(&host);
+            async move { apply_commits(&*host, events).await }.boxed()
+        })
+    };
+    (
+        happyview_source_jetstream::consumer::workers::Batching {
+            apply,
+            max: happyview_source_jetstream::consumer::workers::DEFAULT_BATCH_MAX,
+        },
+        count,
+    )
+}
+
+/// A record the database refuses fails its batch's write; the batch must
+/// not count its other records as applied. They go one at a time instead,
+/// so every good record is written and only the refused one is left out.
+#[tokio::test]
+async fn a_record_the_database_refuses_does_not_lose_the_rest_of_its_batch() {
+    use happyview_source_jetstream::consumer::watermark::WatermarkHandle;
+    use happyview_source_jetstream::consumer::workers::{Job, RetryPolicy, WorkerPool};
+
+    for state in states().await {
+        let did = unique_did();
+        let mut events: Vec<Event> = (1..=10)
+            .map(|seq| commit(&did, seq, &format!("r{seq:05}"), "create"))
+            .collect();
+        // A NUL character in the key: Postgres refuses it in text, as
+        // invalid data (SQLite stores it).
+        if let EventKind::Commit(commit) = &mut events[4].kind {
+            commit.rkey = "r\u{0}0005".into();
+        }
+        let outcomes = apply_commits(&*host(&state), events.clone()).await;
+        assert!(
+            outcomes.iter().all(|o| *o == ApplyOutcome::Applied),
+            "the batch reports only what it applied: {outcomes:?}"
+        );
+        if state.db_backend == crate::db::DatabaseBackend::Postgres {
+            assert!(
+                outcomes.len() < 10,
+                "the refused record stops the batch: {outcomes:?}"
+            );
+        }
+        clean_up(&state, &did).await;
+
+        let (_tx, rx) = tokio::sync::watch::channel(vec![NSID.to_string()]);
+        let watermark = Arc::new(WatermarkHandle::new());
+        let pool = WorkerPool::spawn_batched(
+            1,
+            64,
+            apply_fn(host(&state), rx),
+            Some(batching(host(&state))),
+            Arc::clone(&watermark),
+            RetryPolicy {
+                delays: vec![Duration::from_millis(1)],
+                max_unavailable_delay: Duration::from_millis(2),
+            },
+            give_up_fn(host(&state)),
+        );
+        for event in events {
+            let ticket = watermark.begin(event.cursor);
+            pool.dispatch(Job { ticket, event }).await;
+        }
+        tokio::time::timeout(Duration::from_secs(30), watermark.wait_idle())
+            .await
+            .expect("every event is settled");
+        drop(pool);
+
+        let rows = rkeys(&state, &did).await;
+        let good: Vec<String> = (1..=10)
+            .filter(|seq| *seq != 5)
+            .map(|seq| format!("r{seq:05}"))
+            .collect();
+        for rkey in &good {
+            assert!(rows.contains(rkey), "{rkey} was written: {rows:?}");
+        }
+        if state.db_backend == crate::db::DatabaseBackend::Postgres {
+            assert!(
+                !rows.contains(&"r00005".to_string()),
+                "the refused record is left out"
+            );
+        }
         clean_up(&state, &did).await;
     }
 }

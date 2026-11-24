@@ -60,10 +60,18 @@ impl StreamEvent for Event {
     }
 
     /// A record create, keyed by its DID: a re-sent repo arrives as a long
-    /// run of them. Other commits and every marker go one at a time.
+    /// run of them. Other commits, lexicon schema creates and every marker go
+    /// one at a time.
     fn batch_key(&self) -> Option<&str> {
         match &self.kind {
-            EventKind::Commit(commit) if commit.operation == "create" => Some(&self.did),
+            // A lexicon schema create changes what the instance tracks, so it
+            // goes alone, between the records before and after it.
+            EventKind::Commit(commit)
+                if commit.operation == "create"
+                    && commit.collection != happyview_provider::LEXICON_SCHEMA_COLLECTION =>
+            {
+                Some(&self.did)
+            }
             _ => None,
         }
     }
@@ -1433,5 +1441,14 @@ mod tests {
             commit.operation = "delete".into();
         }
         assert_eq!(delete.batch_key(), None);
+        let mut schema = create("did:plc:a", 1);
+        if let EventKind::Commit(commit) = &mut schema.kind {
+            commit.collection = happyview_provider::LEXICON_SCHEMA_COLLECTION.into();
+        }
+        assert_eq!(
+            schema.batch_key(),
+            None,
+            "a lexicon schema create goes alone"
+        );
     }
 }

@@ -57,10 +57,11 @@ fn apply_batch_fn(host: Arc<dyn Host>) -> BatchApplyFn {
     })
 }
 
-/// Apply a run of commits as one batch: one outcome per event, in order. A
-/// commit the pipeline does not know, or a batch whose outcomes do not line
-/// up with its events, is not applied here; it and everything after it is
-/// reported as not applied, for the worker's one-event path.
+/// Apply a run of commits as one batch: one outcome per event, in order, up
+/// to the first event the batch did not cleanly apply. That event and every
+/// one after it get no outcome, and the worker applies them one at a time.
+/// So do a commit the pipeline does not know, and every event of a batch
+/// whose outcomes do not line up with its events.
 pub async fn apply_commits(host: &dyn Host, events: Vec<Event>) -> Vec<ApplyOutcome> {
     let mut commits = Vec::with_capacity(events.len());
     let mut sources = Vec::with_capacity(events.len());
@@ -83,12 +84,19 @@ pub async fn apply_commits(host: &dyn Host, events: Vec<Event>) -> Vec<ApplyOutc
     }
     let mut outcomes = Vec::with_capacity(commits.len());
     for ((did, cursor, commit), outcome) in commits.into_iter().zip(batch.outcomes) {
-        let judged = commit_outcome(host, &did, cursor, &commit, outcome).await;
-        let applied = judged == ApplyOutcome::Applied;
-        outcomes.push(judged);
-        if !applied {
+        // Only an outcome that says the event itself applied is judged here.
+        // A batch whose write fails marks the failing event and every one
+        // after it with the failure's outcome, `Invalid` included when the
+        // database refused one record's data, so from the first other
+        // outcome on, nothing is known to be written: those events go
+        // through the one-event path, which judges each on its own.
+        if !matches!(
+            outcome,
+            IngestOutcome::Matched | IngestOutcome::Skipped | IngestOutcome::SchemaEvent
+        ) {
             break;
         }
+        outcomes.push(commit_outcome(host, &did, cursor, &commit, outcome).await);
     }
     outcomes
 }
