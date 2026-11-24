@@ -1822,3 +1822,19 @@ async fn a_credential_request_meets_an_unanswering_app_as_an_upstream_failure() 
         assert!(body.get("credential").is_none(), "{label}: {body}");
     }
 }
+
+/// A managing app that takes longer than 10 seconds to answer is an upstream
+/// failure: its late answer, even one that admits, decides nothing.
+#[tokio::test]
+#[serial]
+async fn a_managing_app_that_answers_too_late_is_an_upstream_failure() {
+    common::require_db!();
+    let late = ManagingAppAnswer::Responds(
+        wiremock::ResponseTemplate::new(200)
+            .set_delay(std::time::Duration::from_secs(12))
+            .set_body_json(json!({ "read": true, "write": true })),
+    );
+    let (status, _, body) = through_managing_app(late, Ask::NotifyWrite).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"], json!("UpstreamFailure"), "{body}");
+}

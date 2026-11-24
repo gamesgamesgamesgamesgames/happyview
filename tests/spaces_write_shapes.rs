@@ -397,7 +397,31 @@ async fn a_malformed_write_is_invalid_request() {
         let (status, answer) = post(&app, &author, method, body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {answer}");
         assert_eq!(answer["error"], "InvalidRequest", "{label}: {answer}");
+        // Each refusal says which rule the batch broke.
+        let says = |needle: &str| {
+            answer["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(needle)
+        };
+        match label {
+            "an unknown type" => assert!(says("unknown write type"), "{answer}"),
+            "two tags in one batch" => assert!(says("tagged two ways"), "{answer}"),
+            _ => {}
+        }
     }
+
+    // A `$type` outside applyWrites' own (`#create` of another NSID) doesn't
+    // make a write the lexicons': with no `action`, it's the earlier shape's
+    // malformed write, a 422.
+    let (status, answer) = post(
+        &app,
+        &author,
+        "applyWrites",
+        json!({ "space": space, "writes": [{ "$type": "com.example.other#create", "collection": COLLECTION, "rkey": "a", "value": record("x") }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
     assert!(rkeys(&app, &author, &space).await.is_empty());
 }
 
