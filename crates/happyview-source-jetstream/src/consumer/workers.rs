@@ -13,6 +13,15 @@
 //! retried until it applies: its ticket stays open, the watermark holds, and
 //! the full queue backpressures the reader until the outage ends.
 //!
+//! A run of consecutive events that share a batch key ([`StreamEvent::batch_key`],
+//! for Jetstream a DID's record creates) can be applied as one batch, through
+//! [`Batching`]: a re-sent repo is tens of thousands of creates for one DID on
+//! one worker, and one write per event keeps that worker, and through its full
+//! queue the whole stream, at a few hundred events a second. A batch keeps the
+//! queue's order, and anything it does not apply cleanly falls back to the
+//! one-event path from the first such event, with its retries and give-up.
+//! Tickets still complete one per event, in order, once that event applied.
+//!
 //! The pool is generic over the event (`E`, which only has to name its DID:
 //! [`StreamEvent`]) and the watermark's position (`P`), so another consumer
 //! can reuse it. Jetstream's are [`Event`] and [`CursorPoint`], the
@@ -30,18 +39,41 @@ use futures_util::future::BoxFuture;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::event::{CursorPoint, Event};
+use super::event::{CursorPoint, Event, EventKind};
 use super::watermark::WatermarkHandle;
 
 /// An event a [`WorkerPool`] can order: it names the DID whose worker owns
 /// it.
 pub trait StreamEvent: Clone + Send + 'static {
     fn did(&self) -> &str;
+
+    /// Events with the same key, one after another in a worker's queue, may
+    /// be applied as one batch; `None` (the default) never batches.
+    fn batch_key(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl StreamEvent for Event {
     fn did(&self) -> &str {
         &self.did
+    }
+
+    /// A record create, keyed by its DID: a re-sent repo arrives as a long
+    /// run of them. Other commits, lexicon schema creates and every marker go
+    /// one at a time.
+    fn batch_key(&self) -> Option<&str> {
+        match &self.kind {
+            // A lexicon schema create changes what the instance tracks, so it
+            // goes alone, between the records before and after it.
+            EventKind::Commit(commit)
+                if commit.operation == "create"
+                    && commit.collection != happyview_provider::LEXICON_SCHEMA_COLLECTION =>
+            {
+                Some(&self.did)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -58,6 +90,24 @@ pub enum ApplyOutcome {
 
 /// What a worker does with each event.
 pub type ApplyFn<E = Event> = Arc<dyn Fn(E) -> BoxFuture<'static, ApplyOutcome> + Send + Sync>;
+
+/// What a worker does with a run of batchable events: one outcome per event,
+/// in order. An outcome other than `Applied` (or too few outcomes) sends that
+/// event and every one after it through the one-event path, so the function
+/// must not apply anything past its first failure.
+pub type BatchApplyFn<E = Event> =
+    Arc<dyn Fn(Vec<E>) -> BoxFuture<'static, Vec<ApplyOutcome>> + Send + Sync>;
+
+/// How a pool batches: the function, and the most events one batch takes.
+#[derive(Clone)]
+pub struct Batching<E = Event> {
+    pub apply: BatchApplyFn<E>,
+    pub max: usize,
+}
+
+/// The most events one batch takes unless a pool says otherwise: a
+/// `listRecords` page, which the record store already writes as one.
+pub const DEFAULT_BATCH_MAX: usize = 100;
 
 /// Called once for an event that still failed after every retry, with the
 /// last error. It runs inline before the event's ticket completes, so it
@@ -149,11 +199,26 @@ impl WorkerPool<Event, CursorPoint> {
         retry: RetryPolicy,
         on_give_up: GiveUpFn,
     ) -> Self {
-        Self::spawn_for(
+        Self::spawn_batched(workers, capacity, apply, None, watermark, retry, on_give_up)
+    }
+
+    /// [`WorkerPool::spawn`], batching runs of batchable events with
+    /// `batching` when it is given.
+    pub fn spawn_batched(
+        workers: usize,
+        capacity: usize,
+        apply: ApplyFn,
+        batching: Option<Batching>,
+        watermark: Arc<WatermarkHandle>,
+        retry: RetryPolicy,
+        on_give_up: GiveUpFn,
+    ) -> Self {
+        Self::spawn_for_batched(
             "jetstream",
             workers,
             capacity,
             apply,
+            batching,
             watermark,
             retry,
             on_give_up,
@@ -172,6 +237,24 @@ impl<E: StreamEvent, P: Copy + Send + 'static> WorkerPool<E, P> {
         retry: RetryPolicy,
         on_give_up: GiveUpFn<E>,
     ) -> Self {
+        Self::spawn_for_batched(
+            source, workers, capacity, apply, None, watermark, retry, on_give_up,
+        )
+    }
+
+    /// [`WorkerPool::spawn_for`], batching runs of batchable events with
+    /// `batching` when it is given.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_for_batched(
+        source: impl Into<Arc<str>>,
+        workers: usize,
+        capacity: usize,
+        apply: ApplyFn<E>,
+        batching: Option<Batching<E>>,
+        watermark: Arc<WatermarkHandle<P>>,
+        retry: RetryPolicy,
+        on_give_up: GiveUpFn<E>,
+    ) -> Self {
         let source: Arc<str> = source.into();
         let workers = workers.max(1);
         let depths: Arc<Vec<AtomicUsize>> =
@@ -186,6 +269,7 @@ impl<E: StreamEvent, P: Copy + Send + 'static> WorkerPool<E, P> {
                     index,
                     rx,
                     apply: Arc::clone(&apply),
+                    batching: batching.clone(),
                     watermark: Arc::clone(&watermark),
                     depths: Arc::clone(&depths),
                     busy_since: Arc::clone(&busy_since),
@@ -266,6 +350,7 @@ struct Worker<E, P> {
     index: usize,
     rx: mpsc::Receiver<Job<E>>,
     apply: ApplyFn<E>,
+    batching: Option<Batching<E>>,
     watermark: Arc<WatermarkHandle<P>>,
     depths: Arc<Vec<AtomicUsize>>,
     busy_since: Arc<Vec<AtomicI64>>,
@@ -274,12 +359,102 @@ struct Worker<E, P> {
 }
 
 async fn run_worker<E: StreamEvent, P: Copy>(mut worker: Worker<E, P>) {
-    while let Some(Job { ticket, event }) = worker.rx.recv().await {
-        worker.depths[worker.index].fetch_sub(1, Ordering::Relaxed);
+    // A job taken off the queue while gathering a batch that did not belong
+    // to it: the next one handled.
+    let mut held: Option<Job<E>> = None;
+    loop {
+        let job = match held.take() {
+            Some(job) => job,
+            None => match worker.rx.recv().await {
+                Some(job) => {
+                    worker.depths[worker.index].fetch_sub(1, Ordering::Relaxed);
+                    job
+                }
+                None => break,
+            },
+        };
         worker.busy_since[worker.index]
             .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
-        apply_with_retries(&worker, event).await;
+        let batch = gather_batch(&mut worker, job, &mut held);
+        if batch.len() == 1 {
+            let Job { ticket, event } = batch.into_iter().next().expect("one job");
+            apply_with_retries(&worker, event).await;
+            worker.watermark.complete(ticket);
+        } else {
+            apply_batch(&worker, batch).await;
+        }
         worker.busy_since[worker.index].store(IDLE, Ordering::Relaxed);
+    }
+}
+
+/// `first`, and the jobs already waiting behind it that share its batch key,
+/// up to the batch's maximum. Only jobs already queued are taken: a batch
+/// never waits for more. The first job that does not belong is left in
+/// `held`, to be handled next, so the queue's order is kept.
+fn gather_batch<E: StreamEvent, P>(
+    worker: &mut Worker<E, P>,
+    first: Job<E>,
+    held: &mut Option<Job<E>>,
+) -> Vec<Job<E>> {
+    let Some(batching) = &worker.batching else {
+        return vec![first];
+    };
+    let Some(key) = first.event.batch_key().map(str::to_owned) else {
+        return vec![first];
+    };
+    let max = batching.max.max(1);
+    let mut batch = vec![first];
+    while batch.len() < max {
+        let Ok(next) = worker.rx.try_recv() else {
+            break;
+        };
+        worker.depths[worker.index].fetch_sub(1, Ordering::Relaxed);
+        if next.event.batch_key() == Some(key.as_str()) {
+            batch.push(next);
+        } else {
+            *held = Some(next);
+            break;
+        }
+    }
+    batch
+}
+
+/// Apply a gathered run as one batch, completing each event's ticket in
+/// order as it applies. The events from the first one the batch did not
+/// apply (or every event, if the batch panicked) go through the one-event
+/// path, with its retries and give-up, as if they had never been batched.
+async fn apply_batch<E: StreamEvent, P: Copy>(worker: &Worker<E, P>, batch: Vec<Job<E>>) {
+    let batching = worker
+        .batching
+        .as_ref()
+        .expect("only batching workers gather");
+    let events: Vec<E> = batch.iter().map(|job| job.event.clone()).collect();
+    let outcomes = match AssertUnwindSafe((batching.apply)(events))
+        .catch_unwind()
+        .await
+    {
+        Ok(outcomes) => outcomes,
+        Err(panic) => {
+            tracing::warn!(
+                source = &*worker.source,
+                worker = worker.index,
+                error = %panic_message(&*panic),
+                "applying a batch of stream events panicked; applying them one at a time"
+            );
+            Vec::new()
+        }
+    };
+    let applied = outcomes
+        .iter()
+        .take_while(|outcome| **outcome == ApplyOutcome::Applied)
+        .count()
+        .min(batch.len());
+    let mut jobs = batch.into_iter();
+    for job in jobs.by_ref().take(applied) {
+        worker.watermark.complete(job.ticket);
+    }
+    for Job { ticket, event } in jobs {
+        apply_with_retries(worker, event).await;
         worker.watermark.complete(ticket);
     }
 }
@@ -1027,5 +1202,253 @@ mod tests {
             assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{did}: {seqs:?}");
         }
         assert!(failed_once.load(Ordering::SeqCst), "seq 5 was retried");
+    }
+
+    fn create(did: &str, seq: i64) -> Event {
+        Event {
+            did: did.into(),
+            cursor: CursorPoint::V2 {
+                seq,
+                witnessed_us: seq,
+            },
+            kind: EventKind::Commit(crate::consumer::event::Commit {
+                rev: None,
+                operation: "create".into(),
+                collection: "app.test.post".into(),
+                rkey: format!("r{seq}"),
+                record: Some(serde_json::json!({})),
+                cid: None,
+            }),
+        }
+    }
+
+    /// What a batching pool did: every batch's seqs, and every event applied
+    /// alone, in the order each happened.
+    #[derive(Default)]
+    struct Calls {
+        batches: Vec<Vec<i64>>,
+        singles: Vec<i64>,
+    }
+
+    /// A pool on one worker whose batches apply every event up to (but not
+    /// including) `fail_at` seq, and whose one-event path always applies.
+    /// Its queue is filled before the worker starts taking jobs (`gate`).
+    fn batching_pool(
+        fail_at: Option<i64>,
+        gate: Arc<tokio::sync::Notify>,
+    ) -> (WorkerPool, Arc<WatermarkHandle>, Arc<Mutex<Calls>>) {
+        let calls: Arc<Mutex<Calls>> = Arc::default();
+        let apply: ApplyFn = {
+            let calls = Arc::clone(&calls);
+            let gate = Arc::clone(&gate);
+            Arc::new(move |event: Event| {
+                let calls = Arc::clone(&calls);
+                let gate = Arc::clone(&gate);
+                async move {
+                    if event.cursor.seq() == Some(0) {
+                        gate.notified().await;
+                    }
+                    calls
+                        .lock()
+                        .unwrap()
+                        .singles
+                        .push(event.cursor.seq().expect("seq"));
+                    ApplyOutcome::Applied
+                }
+                .boxed()
+            })
+        };
+        let batch: BatchApplyFn = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |events: Vec<Event>| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    let seqs: Vec<i64> = events.iter().map(|e| e.cursor.seq().unwrap()).collect();
+                    calls.lock().unwrap().batches.push(seqs.clone());
+                    // As a host's batch does: applied up to the first
+                    // failure, which is the last outcome reported.
+                    let mut outcomes = Vec::new();
+                    for seq in seqs {
+                        if fail_at.is_some_and(|fail| seq >= fail) {
+                            outcomes.push(ApplyOutcome::Failed("refused".into()));
+                            break;
+                        }
+                        outcomes.push(ApplyOutcome::Applied);
+                    }
+                    outcomes
+                }
+                .boxed()
+            })
+        };
+        let watermark = Arc::new(WatermarkHandle::new());
+        let (on_give_up, _) = recording_give_up();
+        let pool = WorkerPool::spawn_batched(
+            1,
+            64,
+            apply,
+            Some(Batching {
+                apply: batch,
+                max: 4,
+            }),
+            Arc::clone(&watermark),
+            fast_retry(0),
+            on_give_up,
+        );
+        (pool, watermark, calls)
+    }
+
+    #[tokio::test]
+    async fn a_run_of_one_dids_creates_is_applied_in_batches_in_order() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (pool, watermark, calls) = batching_pool(None, Arc::clone(&gate));
+        // An identity event holds the worker while the queue fills, so the
+        // creates behind it are all waiting when it moves on.
+        send(&pool, &watermark, event("did:plc:a", 0)).await;
+        for seq in 1..=6 {
+            send(&pool, &watermark, create("did:plc:a", seq)).await;
+        }
+        send(&pool, &watermark, event("did:plc:a", 7)).await;
+        send(&pool, &watermark, create("did:plc:a", 8)).await;
+        send(&pool, &watermark, create("did:plc:b", 9)).await;
+        send(&pool, &watermark, create("did:plc:b", 10)).await;
+        gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), watermark.wait_idle())
+            .await
+            .expect("every ticket completes");
+
+        let calls = calls.lock().unwrap();
+        // At most four a batch, never across a DID or a non-create, and a
+        // lone create goes the one-event path.
+        assert_eq!(
+            calls.batches,
+            vec![vec![1, 2, 3, 4], vec![5, 6], vec![9, 10]]
+        );
+        assert_eq!(calls.singles, vec![0, 7, 8]);
+        assert_eq!(watermark.applied().and_then(|p| p.seq()), Some(10));
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_fails_partway_hands_the_rest_to_the_one_event_path() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (pool, watermark, calls) = batching_pool(Some(3), Arc::clone(&gate));
+        send(&pool, &watermark, event("did:plc:a", 0)).await;
+        for seq in 1..=4 {
+            send(&pool, &watermark, create("did:plc:a", seq)).await;
+        }
+        gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), watermark.wait_idle())
+            .await
+            .expect("every ticket completes");
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.batches, vec![vec![1, 2, 3, 4]]);
+        // 1 and 2 applied in the batch and are not applied again; 3 and 4
+        // go one at a time, in order.
+        assert_eq!(calls.singles, vec![0, 3, 4]);
+        assert_eq!(watermark.applied().and_then(|p| p.seq()), Some(4));
+    }
+
+    #[tokio::test]
+    async fn a_batch_cut_off_leaves_its_tickets_open_so_a_resume_replays_it() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let batch: BatchApplyFn = {
+            let started = Arc::clone(&started);
+            Arc::new(move |_events: Vec<Event>| {
+                let started = Arc::clone(&started);
+                async move {
+                    started.notify_one();
+                    // Never finishes: the pool is dropped mid-batch, as a
+                    // shutdown or a crash would cut it off.
+                    std::future::pending::<Vec<ApplyOutcome>>().await
+                }
+                .boxed()
+            })
+        };
+        let apply: ApplyFn = Arc::new(|_event: Event| async { ApplyOutcome::Applied }.boxed());
+        let watermark = Arc::new(WatermarkHandle::new());
+        let (on_give_up, _) = recording_give_up();
+        let pool = WorkerPool::spawn_batched(
+            1,
+            64,
+            apply,
+            Some(Batching {
+                apply: batch,
+                max: 100,
+            }),
+            Arc::clone(&watermark),
+            fast_retry(0),
+            on_give_up,
+        );
+        send(&pool, &watermark, create("did:plc:a", 1)).await;
+        send(&pool, &watermark, create("did:plc:a", 2)).await;
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("the batch starts");
+        drop(pool);
+        // Nothing of the batch counts as applied, so the saved cursor stays
+        // before it and a resume sends both events again.
+        assert_eq!(watermark.applied(), None);
+        assert_eq!(watermark.in_flight(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_panics_applies_its_events_one_at_a_time() {
+        let singles: Arc<Mutex<Vec<i64>>> = Arc::default();
+        let apply: ApplyFn = {
+            let singles = Arc::clone(&singles);
+            Arc::new(move |event: Event| {
+                let singles = Arc::clone(&singles);
+                async move {
+                    singles.lock().unwrap().push(event.cursor.seq().unwrap());
+                    ApplyOutcome::Applied
+                }
+                .boxed()
+            })
+        };
+        let batch: BatchApplyFn =
+            Arc::new(|_events: Vec<Event>| async { panic!("the batch broke") }.boxed());
+        let watermark = Arc::new(WatermarkHandle::new());
+        let (on_give_up, _) = recording_give_up();
+        let pool = WorkerPool::spawn_batched(
+            1,
+            64,
+            apply,
+            Some(Batching {
+                apply: batch,
+                max: 100,
+            }),
+            Arc::clone(&watermark),
+            fast_retry(0),
+            on_give_up,
+        );
+        // The first create is taken alone (nothing is queued behind it yet)
+        // or batched with the second; either way both apply, in order.
+        send(&pool, &watermark, create("did:plc:a", 1)).await;
+        send(&pool, &watermark, create("did:plc:a", 2)).await;
+        tokio::time::timeout(Duration::from_secs(5), watermark.wait_idle())
+            .await
+            .expect("every ticket completes");
+        assert_eq!(*singles.lock().unwrap(), vec![1, 2]);
+        assert_eq!(watermark.applied().and_then(|p| p.seq()), Some(2));
+    }
+
+    #[test]
+    fn only_a_record_create_is_batchable() {
+        assert_eq!(create("did:plc:a", 1).batch_key(), Some("did:plc:a"));
+        assert_eq!(event("did:plc:a", 1).batch_key(), None);
+        let mut delete = create("did:plc:a", 1);
+        if let EventKind::Commit(commit) = &mut delete.kind {
+            commit.operation = "delete".into();
+        }
+        assert_eq!(delete.batch_key(), None);
+        let mut schema = create("did:plc:a", 1);
+        if let EventKind::Commit(commit) = &mut schema.kind {
+            commit.collection = happyview_provider::LEXICON_SCHEMA_COLLECTION.into();
+        }
+        assert_eq!(
+            schema.batch_key(),
+            None,
+            "a lexicon schema create goes alone"
+        );
     }
 }
