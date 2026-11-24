@@ -58,10 +58,11 @@ fn apply_batch_fn(host: Arc<dyn Host>) -> BatchApplyFn {
 }
 
 /// Apply a run of commits as one batch: one outcome per event, in order, up
-/// to the first event the batch did not cleanly apply. That event and every
-/// one after it get no outcome, and the worker applies them one at a time.
-/// So do a commit the pipeline does not know, and every event of a batch
-/// whose outcomes do not line up with its events.
+/// to the first event that did not apply. When the batch's write failed,
+/// that is the first event it did not cleanly apply, which gets no outcome.
+/// The worker applies the rest one at a time, as it does a commit the
+/// pipeline does not know and every event of a batch whose outcomes do not
+/// line up with its events.
 pub async fn apply_commits(host: &dyn Host, events: Vec<Event>) -> Vec<ApplyOutcome> {
     let mut commits = Vec::with_capacity(events.len());
     let mut sources = Vec::with_capacity(events.len());
@@ -78,25 +79,32 @@ pub async fn apply_commits(host: &dyn Host, events: Vec<Event>) -> Vec<ApplyOutc
     if sources.is_empty() {
         return Vec::new();
     }
-    let batch = host.ingest_batch(sources).await;
+    let (batch, write_error) = host.ingest_batch_with_error(sources).await;
     if batch.outcomes.len() != commits.len() {
         return Vec::new();
     }
     let mut outcomes = Vec::with_capacity(commits.len());
     for ((did, cursor, commit), outcome) in commits.into_iter().zip(batch.outcomes) {
-        // Only an outcome that says the event itself applied is judged here.
-        // A batch whose write fails marks the failing event and every one
-        // after it with the failure's outcome, `Invalid` included when the
-        // database refused one record's data, so from the first other
-        // outcome on, nothing is known to be written: those events go
-        // through the one-event path, which judges each on its own.
-        if !matches!(
-            outcome,
-            IngestOutcome::Matched | IngestOutcome::Skipped | IngestOutcome::SchemaEvent
-        ) {
+        // A batch whose write failed marks the failing event and every one
+        // after it with the failure's outcome (`Invalid` when the database
+        // refused one record's data), so from the first event that did not
+        // cleanly apply, nothing is known to be written: those go through
+        // the one-event path, which judges each on its own. Without a write
+        // error every outcome is the event's own, and is judged here.
+        if write_error.is_some()
+            && !matches!(
+                outcome,
+                IngestOutcome::Matched | IngestOutcome::Skipped | IngestOutcome::SchemaEvent
+            )
+        {
             break;
         }
-        outcomes.push(commit_outcome(host, &did, cursor, &commit, outcome).await);
+        let judged = commit_outcome(host, &did, cursor, &commit, outcome).await;
+        let applied = judged == ApplyOutcome::Applied;
+        outcomes.push(judged);
+        if !applied {
+            break;
+        }
     }
     outcomes
 }

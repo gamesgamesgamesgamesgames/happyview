@@ -1493,6 +1493,29 @@ async fn a_record_the_database_refuses_does_not_lose_the_rest_of_its_batch() {
     }
 }
 
+/// An event the pipeline finds invalid on its own (a create with no record)
+/// is judged in place, as one applied alone would be, and the batch goes on:
+/// none of it is applied twice.
+#[tokio::test]
+async fn an_invalid_create_mid_batch_is_judged_in_place() {
+    for state in states().await {
+        let did = unique_did();
+        let mut events: Vec<Event> = (1..=10)
+            .map(|seq| commit(&did, seq, &format!("r{seq:05}"), "create"))
+            .collect();
+        if let EventKind::Commit(commit) = &mut events[4].kind {
+            commit.record = None;
+        }
+        let outcomes = apply_commits(&*host(&state), events).await;
+        assert_eq!(outcomes, vec![ApplyOutcome::Applied; 10], "{outcomes:?}");
+        assert_eq!(rkeys(&state, &did).await.len(), 9);
+        let invalid = logged(&state, "jetstream.record_invalid", &did).await;
+        assert_eq!(invalid.len(), 1, "logged once: {invalid:?}");
+        assert_eq!(invalid[0]["error"], "the create carries no record");
+        clean_up(&state, &did).await;
+    }
+}
+
 /// How much faster a re-sent repo applies in batches. Not run by default:
 /// `cargo test --lib jetstream_tests::apply::benchmark -- --ignored --nocapture`,
 /// with `TEST_DATABASE_URL` for Postgres.
