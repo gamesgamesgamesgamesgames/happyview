@@ -506,11 +506,17 @@ pub async fn sweep(
         return Ok(0);
     }
     let cutoff = rfc3339(now.saturating_sub(u64::from(days) * 86_400));
+    // Records delivered are kept for at least a usage meter's month.
+    let delivered_days = days.max(super::delivered::MIN_KEPT_DAYS);
+    let delivered_cutoff = rfc3339(now.saturating_sub(u64::from(delivered_days) * 86_400));
     let result = crate::db::query(&adapt_sql(
-        "DELETE FROM happyview_script_metrics WHERE bucket_start < ?",
+        "DELETE FROM happyview_script_metrics WHERE bucket_start < ? \
+         AND (kind <> ? OR bucket_start < ?)",
         backend,
     ))
     .bind(cutoff)
+    .bind(super::delivered::KIND)
+    .bind(delivered_cutoff)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
@@ -862,7 +868,6 @@ pub async fn reload(
         restored += u64::from(done);
     }
     metrics.persisted_to.fetch_max(open, Ordering::Relaxed);
-    metrics.delivered().mark_persisted(open);
     Ok(restored)
 }
 

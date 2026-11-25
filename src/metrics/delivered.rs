@@ -2,11 +2,14 @@
 //! minute. Kept apart from the script metrics, and counted whether or not
 //! those are on, so the count doesn't depend on the script-metrics setting.
 //!
-//! Each closed minute is written to `happyview_script_metrics` as a row of
-//! kind `delivered`, keyed by origin, and folded into hour rows and swept
-//! with the rest of the table. A read takes the table and the minutes memory
-//! holds past the watermark. The writer and the reader share a lock, so a
-//! minute written while a read runs is counted once.
+//! Each closed minute is added to its row in `happyview_script_metrics`, of
+//! kind `delivered` and keyed by origin, and taken out of memory once the
+//! write commits; the rows fold into hour rows with the rest of the table.
+//! Memory therefore holds exactly what isn't written, and a read adds the
+//! two. The writer and the reader share a lock, so a minute written while a
+//! read runs is counted once. Adding rather than replacing means a count
+//! that arrives late, or from a second process under the same instance id,
+//! adds to the row instead of overwriting it.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -22,6 +25,10 @@ use super::ingest::{ORIGINS, RecordOrigin};
 pub const KIND: &str = "delivered";
 
 const MINUTE_SECS: u64 = 60;
+
+/// The fewest days delivered rows are kept, whatever the table's retention:
+/// a month and a margin, for the usage meter's reads.
+pub const MIN_KEPT_DAYS: u32 = 35;
 
 /// Minutes held for a database that can't be written, two days' worth.
 /// Past that the oldest are dropped, so a long outage can't grow memory.
@@ -40,10 +47,8 @@ pub struct Counters {
 
 #[derive(Default)]
 struct Held {
-    /// Minute start to records by origin, for the minutes not yet written.
+    /// Minute start to records by origin, not yet written.
     minutes: BTreeMap<u64, [u64; ORIGINS.len()]>,
-    /// Every minute starting before this is in the table.
-    persisted_to: u64,
 }
 
 #[derive(Default)]
@@ -65,13 +70,18 @@ impl Delivered {
         let minute = align(at, MINUTE_SECS);
         held.minutes.entry(minute).or_default()[origin.index()] += 1;
         while held.minutes.len() > MAX_HELD_MINUTES {
-            held.minutes.pop_first();
+            if let Some((minute, counts)) = held.minutes.pop_first() {
+                tracing::warn!(
+                    minute,
+                    records = counts.iter().sum::<u64>(),
+                    "dropping records delivered that could not be written"
+                );
+            }
         }
     }
 
-    /// Write every minute closed by `now` and move the watermark past it.
-    /// Rewriting a minute replaces its row, so a failed write is retried
-    /// whole on the next tick. Returns the rows written.
+    /// Add every minute closed by `now` to its row. A failed write leaves
+    /// memory as it was, for the next tick. Returns the rows written.
     pub async fn write_closed(
         &self,
         pool: &AnyPool,
@@ -90,20 +100,39 @@ impl Delivered {
         let mut written = 0;
         if !closed.is_empty() {
             let sql = super::persist::upsert_sql(backend);
-            let mut tx = pool.begin().await?;
+            let held_sql = adapt_sql(
+                "SELECT counters FROM happyview_script_metrics \
+                 WHERE kind = ? AND key = ? AND variant = '' AND resolution = 'minute' \
+                 AND bucket_start = ? AND instance = ?",
+                backend,
+            );
+            let mut tx = crate::db::begin_write(pool, backend).await?;
             for (minute, counts) in &closed {
                 for (i, n) in counts.iter().enumerate() {
                     if *n == 0 {
                         continue;
                     }
-                    let counters = serde_json::to_string(&Counters { records: *n })
-                        .unwrap_or_else(|_| "{}".into());
+                    let start = super::rfc3339(*minute);
+                    let before: Option<String> = crate::db::query_scalar(&held_sql)
+                        .bind(KIND)
+                        .bind(ORIGINS[i])
+                        .bind(&start)
+                        .bind(instance)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                    let before = before
+                        .and_then(|c| serde_json::from_str::<Counters>(&c).ok())
+                        .map_or(0, |c| c.records);
+                    let counters = serde_json::to_string(&Counters {
+                        records: before.saturating_add(*n),
+                    })
+                    .unwrap_or_else(|_| "{}".into());
                     crate::db::query(&sql)
                         .bind(KIND)
                         .bind(ORIGINS[i])
                         .bind("")
                         .bind("minute")
-                        .bind(super::rfc3339(*minute))
+                        .bind(&start)
                         .bind(counters)
                         .bind("{}")
                         .bind(instance)
@@ -114,9 +143,18 @@ impl Delivered {
             }
             tx.commit().await?;
         }
+        // What was written leaves memory; what arrived since stays.
         let mut held = self.lock();
-        held.minutes.retain(|m, _| *m >= open);
-        held.persisted_to = held.persisted_to.max(open);
+        for (minute, counts) in &closed {
+            if let Some(left) = held.minutes.get_mut(minute) {
+                for (slot, n) in left.iter_mut().zip(counts) {
+                    *slot = slot.saturating_sub(*n);
+                }
+                if left.iter().all(|n| *n == 0) {
+                    held.minutes.remove(minute);
+                }
+            }
+        }
         Ok(written)
     }
 
@@ -158,7 +196,7 @@ impl Delivered {
                 c.records;
         }
         let held = self.lock();
-        for (minute, counts) in held.minutes.range(held.persisted_to..) {
+        for (minute, counts) in &held.minutes {
             if *minute < from || *minute >= to || *minute > now {
                 continue;
             }
@@ -181,13 +219,6 @@ impl Delivered {
                     .collect(),
             })
             .collect())
-    }
-
-    /// Move the watermark to `open`, as a boot that starts empty does: the
-    /// table holds everything before it.
-    pub fn mark_persisted(&self, open: u64) {
-        let mut held = self.lock();
-        held.persisted_to = held.persisted_to.max(align(open, MINUTE_SECS));
     }
 }
 
@@ -289,6 +320,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_late_count_and_a_second_writer_add_to_the_row() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let d = Delivered::default();
+        d.count_at(T0 + 10, RecordOrigin::Live);
+        d.write_closed(&pool, SQLITE, "a", T0 + 70).await.unwrap();
+        // Late, for a minute already written.
+        d.count_at(T0 + 20, RecordOrigin::Live);
+        // Another process under the same id.
+        let other = Delivered::default();
+        other.count_at(T0 + 30, RecordOrigin::Live);
+        other
+            .write_closed(&pool, SQLITE, "a", T0 + 70)
+            .await
+            .unwrap();
+        let read = d
+            .read(&pool, SQLITE, T0 + 80, T0, T0 + 60, 60)
+            .await
+            .unwrap();
+        assert_eq!(read[0].records, 3, "the late count is read from memory");
+        d.write_closed(&pool, SQLITE, "a", T0 + 130).await.unwrap();
+        assert!(d.lock().minutes.is_empty());
+        let read = d
+            .read(&pool, SQLITE, T0 + 140, T0, T0 + 60, 60)
+            .await
+            .unwrap();
+        assert_eq!(read[0].records, 3);
+    }
+
+    #[tokio::test]
     async fn folded_rows_count_the_same() {
         let pool = crate::test_support::migrated_memory_pool().await;
         let d = Delivered::default();
@@ -317,7 +377,19 @@ mod tests {
         pool.close().await;
         assert!(d.write_closed(&pool, SQLITE, "a", T0 + 120).await.is_err());
         assert_eq!(d.lock().minutes.len(), 1);
-        assert_eq!(d.lock().persisted_to, 0);
+    }
+
+    #[tokio::test]
+    async fn delivered_rows_outlive_a_short_retention() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let d = Delivered::default();
+        d.count_at(T0, RecordOrigin::Live);
+        d.write_closed(&pool, SQLITE, "a", T0 + 60).await.unwrap();
+        let sweep = |days_later: u64, keep: u32| {
+            super::super::persist::sweep(&pool, SQLITE, T0 + days_later * 86_400, keep)
+        };
+        assert_eq!(sweep(10, 1).await.unwrap(), 0);
+        assert_eq!(sweep(36, 1).await.unwrap(), 1);
     }
 
     #[test]

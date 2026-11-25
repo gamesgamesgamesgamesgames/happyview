@@ -236,6 +236,13 @@ impl RecordTimer {
         )
     }
 
+    /// The record wasn't delivered after all: its write failed, and the
+    /// source will hand it over again. Measured, but not counted.
+    pub fn undelivered(mut self) -> Self {
+        self.1 = None;
+        self
+    }
+
     /// A timer that measures and counts nothing.
     pub fn off() -> Self {
         Self(None, None)
