@@ -1102,6 +1102,21 @@ enum ManagingAppAnswer {
     OnlyAt(&'static str, wiremock::ResponseTemplate),
     /// Its service endpoint is a port nothing listens on.
     Unreachable,
+    /// It refuses a space named in the `at:space/` form as malformed (400),
+    /// and answers this to the `at://…/space/…` form.
+    RefusesAtSpace(wiremock::ResponseTemplate),
+}
+
+/// A request naming its space in the `at:space/` form.
+struct NamesAtSpace;
+
+impl wiremock::Match for NamesAtSpace {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        request
+            .url
+            .query_pairs()
+            .any(|(k, v)| k == "space" && v.starts_with("at:space/"))
+    }
 }
 
 /// A newcomer's `notifyWrite` to a space a managing app governs, answered by
@@ -1154,6 +1169,22 @@ async fn through_managing_app(
             Mock::given(method("GET"))
                 .and(path(at))
                 .respond_with(response)
+                .mount(&managing_app)
+                .await;
+            managing_app.uri()
+        }
+        ManagingAppAnswer::RefusesAtSpace(response) => {
+            Mock::given(method("GET"))
+                .and(NamesAtSpace)
+                .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(
+                    json!({ "error": "InvalidRequest", "message": "Invalid space-ref format" }),
+                ))
+                .with_priority(1)
+                .mount(&managing_app)
+                .await;
+            Mock::given(method("GET"))
+                .respond_with(response)
+                .with_priority(2)
                 .mount(&managing_app)
                 .await;
             managing_app.uri()
@@ -1837,4 +1868,29 @@ async fn a_managing_app_that_answers_too_late_is_an_upstream_failure() {
     let (status, _, body) = through_managing_app(late, Ask::NotifyWrite).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(body["error"], json!("UpstreamFailure"), "{body}");
+}
+
+/// `checkAccess` names the space as `at:space/`, and an app that refuses that
+/// form as malformed is asked once more in the `at://` form.
+#[tokio::test]
+#[serial]
+async fn check_access_names_the_space_as_at_space_then_as_before() {
+    common::require_db!();
+    let (status, asked, body) = through_managing_app(
+        ManagingAppAnswer::RefusesAtSpace(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({ "read": true, "write": true })),
+        ),
+        Ask::NotifyWrite,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        asked,
+        vec![
+            "com.atproto.managedspace.checkAccess".to_string(),
+            "com.atproto.managedspace.checkAccess".to_string()
+        ],
+        "the same method, in each form"
+    );
 }

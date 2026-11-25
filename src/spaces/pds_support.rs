@@ -413,6 +413,89 @@ pub async fn get_support(
     Ok(fresh)
 }
 
+/// The form `pds` takes space URIs in: `at:space/` unless it has refused
+/// that form before.
+pub async fn space_uri_form(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    pds: &str,
+) -> Result<crate::spaces::UriForm, AppError> {
+    let row: Option<(String,)> = crate::db::query_as(&adapt_sql(
+        "SELECT pds_endpoint FROM happyview_space_host_uri_forms WHERE pds_endpoint = ?",
+        backend,
+    ))
+    .bind(pds)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to read a host's URI form: {e}")))?;
+    Ok(if row.is_some() {
+        crate::spaces::UriForm::Legacy
+    } else {
+        crate::spaces::UriForm::AtSpace
+    })
+}
+
+/// Remember that `pds` takes space URIs in the `at://…/space/…` form only.
+pub async fn remember_legacy_space_uri(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    pds: &str,
+) -> Result<(), AppError> {
+    crate::db::query(&adapt_sql(
+        "INSERT INTO happyview_space_host_uri_forms (pds_endpoint, recorded_at) VALUES (?, ?) \
+         ON CONFLICT (pds_endpoint) DO NOTHING",
+        backend,
+    ))
+    .bind(pds)
+    .bind(crate::db::now_rfc3339())
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to record a host's URI form: {e}")))?;
+    Ok(())
+}
+
+/// Whether a host's refusal is of the space URI's form: an `InvalidRequest`
+/// that names the space. A host that predates `at:space/` refuses one as a
+/// malformed space reference.
+pub fn refuses_space_uri_form(err: &AppError) -> bool {
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("invalidrequest") && text.contains("space")
+}
+
+/// Call a PDS with a space URI in the form it takes. A host not known to
+/// take only the earlier form is sent `at:space/`; if it refuses that as
+/// malformed, it is asked once more in the earlier form, which is remembered.
+/// `pds` is the host's endpoint, or `None` when it isn't known (then
+/// `at:space/` is tried first all the same, and nothing is remembered).
+pub async fn with_space_uri_form<T, F, Fut>(
+    state: &AppState,
+    pds: Option<&str>,
+    space_uri: &str,
+    mut call: F,
+) -> Result<T, AppError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<T, AppError>>,
+{
+    use crate::spaces::UriForm;
+    let form = match pds {
+        Some(pds) => space_uri_form(&state.db, state.db_backend, pds).await?,
+        None => UriForm::AtSpace,
+    };
+    match call(form.write(space_uri)).await {
+        Err(err) if form == UriForm::AtSpace && refuses_space_uri_form(&err) => {
+            let answer = call(UriForm::Legacy.write(space_uri)).await;
+            if answer.is_ok()
+                && let Some(pds) = pds
+            {
+                remember_legacy_space_uri(&state.db, state.db_backend, pds).await?;
+            }
+            answer
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,5 +934,118 @@ mod tests {
                 .supported
         );
         // `expect(1)` is asserted when the server drops.
+    }
+
+    mod uri_forms {
+        use super::*;
+        use crate::spaces::UriForm;
+        use std::sync::{Arc, Mutex};
+
+        const SPACE: &str = "at://did:plc:auth/space/com.example.forum/main";
+        const NEW: &str = "at:space/did:plc:auth/com.example.forum/main";
+        const PDS: &str = "https://pds.example";
+
+        fn refusal() -> AppError {
+            AppError::Internal(
+                "PDS query failed: InvalidRequest: Invalid space-ref format: space".into(),
+            )
+        }
+
+        /// Call `with_space_uri_form` with a host that answers `answer` to
+        /// each space it is sent, returning what it was sent.
+        async fn sent_to(
+            state: &AppState,
+            pds: Option<&str>,
+            answer: impl Fn(&str) -> Result<(), AppError>,
+        ) -> (Result<(), AppError>, Vec<String>) {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let result = with_space_uri_form(state, pds, SPACE, |space| {
+                sent.lock().unwrap().push(space.clone());
+                let answer = answer(&space);
+                async move { answer }
+            })
+            .await;
+            let sent = sent.lock().unwrap().clone();
+            (result, sent)
+        }
+
+        #[tokio::test]
+        async fn a_host_is_sent_the_at_space_form() {
+            let state = crate::test_support::test_state_with_pool(
+                crate::test_support::migrated_memory_pool().await,
+            );
+            let (result, sent) = sent_to(&state, Some(PDS), |_| Ok(())).await;
+            assert!(result.is_ok());
+            assert_eq!(sent, [NEW]);
+            assert_eq!(
+                space_uri_form(&state.db, state.db_backend, PDS)
+                    .await
+                    .unwrap(),
+                UriForm::AtSpace
+            );
+        }
+
+        #[tokio::test]
+        async fn a_host_refusing_at_space_is_asked_once_more_and_remembered() {
+            let state = crate::test_support::test_state_with_pool(
+                crate::test_support::migrated_memory_pool().await,
+            );
+            let earlier_only = |space: &str| {
+                if space.starts_with("at:space/") {
+                    Err(refusal())
+                } else {
+                    Ok(())
+                }
+            };
+            let (result, sent) = sent_to(&state, Some(PDS), earlier_only).await;
+            assert!(result.is_ok());
+            assert_eq!(sent, [NEW, SPACE]);
+            assert_eq!(
+                space_uri_form(&state.db, state.db_backend, PDS)
+                    .await
+                    .unwrap(),
+                UriForm::Legacy
+            );
+
+            // Remembered: the next call goes straight to the earlier form.
+            let (result, sent) = sent_to(&state, Some(PDS), earlier_only).await;
+            assert!(result.is_ok());
+            assert_eq!(sent, [SPACE]);
+        }
+
+        #[tokio::test]
+        async fn another_failure_is_not_retried_or_remembered() {
+            let state = crate::test_support::test_state_with_pool(
+                crate::test_support::migrated_memory_pool().await,
+            );
+            let (result, sent) = sent_to(&state, Some(PDS), |_| {
+                Err(AppError::Internal("PDS query failed: RepoNotFound".into()))
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(sent, [NEW]);
+
+            // A refusal of both forms isn't remembered either.
+            let (result, sent) = sent_to(&state, Some(PDS), |_| Err(refusal())).await;
+            assert!(result.is_err());
+            assert_eq!(sent, [NEW, SPACE]);
+            assert_eq!(
+                space_uri_form(&state.db, state.db_backend, PDS)
+                    .await
+                    .unwrap(),
+                UriForm::AtSpace
+            );
+
+            // With no endpoint known, nothing is remembered.
+            let (_, sent) = sent_to(&state, None, |space: &str| {
+                if space.starts_with("at:space/") {
+                    Err(refusal())
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
+            assert_eq!(sent, [NEW, SPACE]);
+        }
     }
 }

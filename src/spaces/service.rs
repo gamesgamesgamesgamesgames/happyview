@@ -551,18 +551,35 @@ pub(crate) async fn forward_write_if_native(
             ))
         })?;
 
-    let resp = crate::repo::pds::pds_post_json_raw(state, &session, method, &body).await?;
-    if !resp.status().is_success() {
-        let detail = resp.text().await.unwrap_or_default();
-        return Err(AppError::BadGateway(format!(
-            "the user's PDS rejected {method}: {detail}"
-        )));
-    }
-
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to read PDS response: {e}")))?;
+    // The space named in the form the author's host takes.
+    let pds = crate::spaces::auth::resolve_did_service_endpoint(
+        &state.http,
+        &state.config.plc_url,
+        author_did,
+    )
+    .await
+    .ok();
+    let space = body["space"].as_str().unwrap_or_default().to_string();
+    let bytes =
+        crate::spaces::pds_support::with_space_uri_form(state, pds.as_deref(), &space, |space| {
+            let mut body = body.clone();
+            body["space"] = space.into();
+            let session = &session;
+            async move {
+                let resp =
+                    crate::repo::pds::pds_post_json_raw(state, session, method, &body).await?;
+                if !resp.status().is_success() {
+                    let detail = resp.text().await.unwrap_or_default();
+                    return Err(AppError::BadGateway(format!(
+                        "the user's PDS rejected {method}: {detail}"
+                    )));
+                }
+                resp.bytes()
+                    .await
+                    .map_err(|e| AppError::Internal(format!("failed to read PDS response: {e}")))
+            }
+        })
+        .await?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| AppError::Internal(format!("PDS returned invalid JSON: {e}")))?;
     Ok(Some(value))

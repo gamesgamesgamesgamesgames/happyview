@@ -259,23 +259,40 @@ async fn migrate(state: &AppState, job: &Job, input: &Input) -> Result<NativeOut
     let batches = replay_batches(&space_uri, &input.author_did, &records)
         .into_iter()
         .zip(records.chunks(BATCH_SIZE).map(<[SpaceRecord]>::len));
+    // The author's host, to name the space in the form it takes.
+    let pds = crate::spaces::auth::resolve_did_service_endpoint(
+        &state.http,
+        &state.config.plc_url,
+        &input.author_did,
+    )
+    .await
+    .ok();
     let replayed = replay(state, job, batches, total, |body| {
         let session = &session;
+        let pds = pds.as_deref();
         async move {
-            let resp = crate::repo::pds::pds_post_json_raw(
-                state,
-                session,
-                "com.atproto.space.applyWrites",
-                &body,
-            )
-            .await?;
-            if !resp.status().is_success() {
-                let detail = resp.text().await.unwrap_or_default();
-                return Err(AppError::Internal(format!(
-                    "applyWrites rejected a batch: {detail}"
-                )));
-            }
-            Ok(())
+            let space = body["space"].as_str().unwrap_or_default().to_string();
+            crate::spaces::pds_support::with_space_uri_form(state, pds, &space, |space| {
+                let mut body = body.clone();
+                body["space"] = space.into();
+                async move {
+                    let resp = crate::repo::pds::pds_post_json_raw(
+                        state,
+                        session,
+                        "com.atproto.space.applyWrites",
+                        &body,
+                    )
+                    .await?;
+                    if !resp.status().is_success() {
+                        let detail = resp.text().await.unwrap_or_default();
+                        return Err(AppError::Internal(format!(
+                            "applyWrites rejected a batch: {detail}"
+                        )));
+                    }
+                    Ok(())
+                }
+            })
+            .await
         }
     })
     .await?;

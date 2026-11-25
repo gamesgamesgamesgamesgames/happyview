@@ -139,7 +139,8 @@ pub fn verify_commit(
             commit.ver
         )));
     }
-    if commit.repo != author_did || commit.space != space_uri {
+    // The host writes the space in its form, which may not be the one asked.
+    if commit.repo != author_did || !crate::spaces::same_space_uri(&commit.space, space_uri) {
         return Err(AppError::Auth(
             "commit describes a different repo than the one requested".into(),
         ));
@@ -343,6 +344,22 @@ mod tests {
         let mut tampered = c.clone();
         tampered.data[0] ^= 1;
         assert!(verify_commit(&tampered, &c.space, &c.repo, &ss, &mac).is_err());
+    }
+
+    #[test]
+    fn a_commit_verifies_for_its_space_named_in_either_form() {
+        let v = &vectors()[0];
+        let ss: [u8; 32] = from_hex(&v.shared_secret_hex).try_into().unwrap();
+        let mac = parse_mac_header(&v.mac_header).unwrap();
+        let c = commit(v);
+        let other_form = if c.space.starts_with("at:space/") {
+            crate::spaces::UriForm::Legacy.write(&c.space)
+        } else {
+            crate::spaces::UriForm::AtSpace.write(&c.space)
+        };
+        assert_ne!(other_form, c.space);
+        verify_commit(&c, &other_form, &c.repo, &ss, &mac)
+            .expect("the host may name the space in the other form");
     }
 
     #[test]

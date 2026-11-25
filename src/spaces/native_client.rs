@@ -268,36 +268,53 @@ pub async fn get_verified_commit(
         crate::profile::resolve_did_document(&state.http, &state.config.plc_url, author_did)
             .await?;
     let exchange = space_mac::author_kem_key(&did_doc)?.map(|key| space_mac::encapsulate(&key));
+    let want = exchange
+        .as_ref()
+        .map(|exchange| space_mac::want_mac_header(&exchange.key_share))
+        .transpose()?;
+    let pds = crate::profile::find_service_endpoint(&did_doc, "atproto_pds");
 
-    let params = [
-        ("space", space_uri.to_string()),
-        // `repo`, not `did`: ZDS answers InvalidRequest "Missing repo"
-        // without it.
-        ("repo", author_did.to_string()),
-    ];
-    let request = crate::repo::pds::pds_get_json(
+    // The space named in the form the author's host takes.
+    let (body, mac_header) = crate::spaces::pds_support::with_space_uri_form(
         state,
-        session,
-        "com.atproto.space.getLatestCommit",
-        &params,
-    );
-    let (body, mac_header) = match &exchange {
-        Some(exchange) => {
-            let want = space_mac::want_mac_header(&exchange.key_share)?;
-            let (body, received) = crate::http_retry::with_header_exchange(
-                (
-                    HeaderName::from_static(space_mac::WANT_MAC_HEADER),
-                    HeaderValue::from_str(&want)
-                        .map_err(|_| AppError::Internal("unsendable MAC request".into()))?,
-                ),
-                HeaderName::from_static(space_mac::MAC_HEADER),
-                request,
-            )
-            .await;
-            (body?, received)
-        }
-        None => (request.await?, None),
-    };
+        pds.as_deref(),
+        space_uri,
+        |space| {
+            let want = want.clone();
+            async move {
+                let params = [
+                    ("space", space),
+                    // `repo`, not `did`: ZDS answers InvalidRequest "Missing
+                    // repo" without it.
+                    ("repo", author_did.to_string()),
+                ];
+                let request = crate::repo::pds::pds_get_json(
+                    state,
+                    session,
+                    "com.atproto.space.getLatestCommit",
+                    &params,
+                );
+                match want {
+                    Some(want) => {
+                        let (body, received) = crate::http_retry::with_header_exchange(
+                            (
+                                HeaderName::from_static(space_mac::WANT_MAC_HEADER),
+                                HeaderValue::from_str(&want).map_err(|_| {
+                                    AppError::Internal("unsendable MAC request".into())
+                                })?,
+                            ),
+                            HeaderName::from_static(space_mac::MAC_HEADER),
+                            request,
+                        )
+                        .await;
+                        Ok((body?, received))
+                    }
+                    None => Ok((request.await?, None)),
+                }
+            }
+        },
+    )
+    .await?;
 
     let commit = body
         .get("commit")
@@ -324,7 +341,14 @@ pub fn verify_remote_commit(
     if commit.get("data").is_none() {
         let commit = parse_signed_commit(commit)?;
         let key = signing_key_from_doc(did_doc, author_did)?;
-        crate::spaces::commit::verify_commit(&commit, space_uri, author_did, &key)?;
+        // Signed commits predate `at:space/`: their signature covers the
+        // `at://…/space/…` form.
+        crate::spaces::commit::verify_commit(
+            &commit,
+            &crate::spaces::canonical_uri(space_uri),
+            author_did,
+            &key,
+        )?;
         return Ok(VerifiedCommit::Signed(commit));
     }
 
@@ -363,10 +387,31 @@ pub async fn list_repo_ops(
     author_did: &str,
     since: Option<&str>,
 ) -> Result<Vec<RepoOp>, AppError> {
-    collect_repo_ops(space_uri, author_did, since, |params| async move {
-        crate::repo::pds::pds_get_json(state, session, "com.atproto.space.listRepoOps", &params)
+    let pds = crate::spaces::auth::resolve_did_service_endpoint(
+        &state.http,
+        &state.config.plc_url,
+        author_did,
+    )
+    .await
+    .ok();
+    // The space named in the form the author's host takes, for every page.
+    crate::spaces::pds_support::with_space_uri_form(
+        state,
+        pds.as_deref(),
+        space_uri,
+        |space| async move {
+            collect_repo_ops(&space, author_did, since, |params| async move {
+                crate::repo::pds::pds_get_json(
+                    state,
+                    session,
+                    "com.atproto.space.listRepoOps",
+                    &params,
+                )
+                .await
+            })
             .await
-    })
+        },
+    )
     .await
 }
 
