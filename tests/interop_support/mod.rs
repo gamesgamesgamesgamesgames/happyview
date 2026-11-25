@@ -294,7 +294,7 @@ pub async fn did_doc(plc_url: &str, did: &str) -> happyview::profile::DidDocumen
 /// A `getLatestCommit` answer, with what a syncer needs to authenticate it.
 pub struct FetchedCommit {
     pub json: Value,
-    pub mac_header: Option<reqwest::header::HeaderValue>,
+    pub headers: reqwest::header::HeaderMap,
     pub exchange: Option<happyview::spaces::space_mac::Encapsulation>,
 }
 
@@ -320,18 +320,17 @@ pub async fn fetch_latest_commit(
         .query(&[("space", space_uri), ("repo", repo)])
         .bearer_auth(token);
     if let Some(exchange) = &exchange {
-        req = req.header(
-            space_mac::WANT_MAC_HEADER,
-            space_mac::want_mac_header(&exchange.key_share).unwrap(),
-        );
+        for (name, value) in space_mac::commit_mac_request_headers(exchange).unwrap() {
+            req = req.header(name, value);
+        }
     }
     let resp = req.send().await.expect("getLatestCommit request");
     assert_eq!(resp.status().as_u16(), 200, "getLatestCommit failed");
-    let mac_header = resp.headers().get(space_mac::MAC_HEADER).cloned();
+    let headers = resp.headers().clone();
     let json = resp.json::<Value>().await.expect("commit json")["commit"].clone();
     FetchedCommit {
         json,
-        mac_header,
+        headers,
         exchange,
     }
 }
@@ -353,7 +352,7 @@ pub async fn verified_latest_commit(
         repo,
         &doc,
         fetched.exchange.as_ref(),
-        fetched.mac_header.as_ref(),
+        &fetched.headers,
     )
     .unwrap_or_else(|e| panic!("the host's commit must verify with our own code: {e}"))
 }
