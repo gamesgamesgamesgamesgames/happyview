@@ -165,12 +165,8 @@ async fn create_space(
         },
         e => e,
     })?;
-    // A new space is named in the current form, as nothing in the request
-    // says otherwise.
-    Ok(Json(space_ref_body(
-        &space,
-        crate::spaces::UriForm::AtSpace,
-    )))
+    // Nothing in the request names a space to copy the form from.
+    Ok(Json(space_ref_body(&space, crate::spaces::NEW_SPACE_FORM)))
 }
 
 /// Replace a space's policy wholesale. A policy of another `$type` migrates
@@ -312,7 +308,7 @@ mod tests {
             let uri = body["uri"].as_str().unwrap().to_string();
             assert_eq!(
                 body["space"],
-                serde_json::json!(crate::spaces::UriForm::AtSpace.write(&uri)),
+                serde_json::json!(crate::spaces::NEW_SPACE_FORM.write(&uri)),
                 "{body}"
             );
             uri

@@ -65,8 +65,12 @@ fn key() -> SigningKey {
     SigningKey::from_slice(&bytes).unwrap()
 }
 
+/// `uri` (`at://<did>/space/<type>/<skey>[/<rest>]`) in the `at:space/`
+/// form, written out here rather than by the code under test.
 fn at_space(uri: &str) -> String {
-    happyview::spaces::UriForm::AtSpace.write(uri)
+    let rest = uri.strip_prefix("at://").expect("an at:// URI");
+    let (did, rest) = rest.split_once("/space/").expect("a space URI");
+    format!("at:space/{did}/{rest}")
 }
 
 /// The claims of a JWT, unverified.
@@ -372,6 +376,10 @@ async fn a_space_named_as_a_member_is_kept_in_the_form_compared() {
     )
     .await;
     assert!(status.is_success(), "{body}");
+    assert_eq!(
+        body["member"]["did"], child["uri"],
+        "answered in the at:// form it is stored in: {body}"
+    );
 
     let (status, listed) = get(
         &app,
@@ -389,6 +397,24 @@ async fn a_space_named_as_a_member_is_kept_in_the_form_compared() {
         !nested.contains("at:space/"),
         "stored in the at:// form: {listed}"
     );
+
+    // Asked in the at:space/ form, nested spaces are named in that form.
+    let (status, listed) = get(
+        &app,
+        CREATOR,
+        &format!(
+            "/xrpc/dev.happyview.space.listNestedSpaces?space={}",
+            urlencoding::encode(&at_space(parent["uri"].as_str().unwrap()))
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let nested = listed.to_string();
+    assert!(
+        nested.contains(&at_space(child["uri"].as_str().unwrap())),
+        "{listed}"
+    );
+    assert!(!nested.contains("at://"), "{listed}");
 
     // Naming it again in the other form is the same entry.
     let (status, body) = post(

@@ -940,7 +940,7 @@ async fn list_spaces(
         .map(|v| {
             let mut view = serde_json::json!({
                 "uri": v.uri,
-                "space": crate::spaces::UriForm::AtSpace.write(&v.uri),
+                "space": crate::spaces::NEW_SPACE_FORM.write(&v.uri),
                 "isOwner": v.is_owner,
             });
             if let Some(rev) = v.repo_rev {

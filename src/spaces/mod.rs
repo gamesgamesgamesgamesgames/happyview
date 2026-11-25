@@ -214,6 +214,11 @@ impl UriForm {
     }
 }
 
+/// The form a new space is named in when the request names no space to copy
+/// the form from (`space` on createSpace and listSpaces). `uri`, the Oct 29
+/// name, stays in the `at://` form either way.
+pub const NEW_SPACE_FORM: UriForm = UriForm::AtSpace;
+
 /// Whether a string names a space (or a record in one) rather than an
 /// account, in any of the forms [`SpaceUri::parse`] reads.
 pub fn is_space_reference(s: &str) -> bool {
