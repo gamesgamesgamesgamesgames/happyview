@@ -18,6 +18,9 @@ use crate::telemetry::counters::Counters;
 pub struct TelemetryState {
     pub counters: Arc<Counters>,
     pub base_path: Option<String>,
+    /// For the usage meter's XRPC request count, kept whatever the
+    /// telemetry settings.
+    pub metrics: Option<Arc<crate::metrics::ScriptMetrics>>,
 }
 
 impl FromRef<AppState> for TelemetryState {
@@ -25,6 +28,7 @@ impl FromRef<AppState> for TelemetryState {
         TelemetryState {
             counters: state.telemetry_counters.clone(),
             base_path: state.config.base_path.clone(),
+            metrics: Some(state.metrics.clone()),
         }
     }
 }
@@ -60,12 +64,18 @@ pub async fn count_http_bytes(
     State(TelemetryState {
         counters,
         base_path,
+        metrics,
     }): State<TelemetryState>,
     req: Request,
     next: Next,
 ) -> Response {
     if strip_base_path(req.uri().path(), base_path.as_deref()).starts_with("/xrpc/") {
         counters.xrpc_requests.fetch_add(1, Ordering::Relaxed);
+        if let Some(metrics) = &metrics {
+            metrics
+                .xrpc()
+                .count_at(crate::metrics::unix_now(), req.method());
+        }
         let has_credentials = req.headers().contains_key(header::AUTHORIZATION)
             || req
                 .headers()
@@ -106,6 +116,7 @@ mod tests {
         TelemetryState {
             counters: counters.clone(),
             base_path: None,
+            metrics: None,
         }
     }
 
@@ -273,11 +284,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_xrpc_request_is_counted_for_the_usage_meter_by_method() {
+        let counters = Arc::new(Counters::new());
+        let metrics = Arc::new(crate::metrics::ScriptMetrics::new());
+        metrics.set_enabled(false);
+        let telemetry_state = TelemetryState {
+            counters: counters.clone(),
+            base_path: None,
+            metrics: Some(metrics.clone()),
+        };
+        let app = Router::new()
+            .route(
+                "/xrpc/com.example.probe",
+                get(|| async { "ok" }).post(|| async { "ok" }),
+            )
+            .route("/health", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                telemetry_state.clone(),
+                count_http_bytes,
+            ))
+            .with_state(telemetry_state);
+        for (method, uri) in [
+            ("GET", "/xrpc/com.example.probe"),
+            ("POST", "/xrpc/com.example.probe"),
+            ("GET", "/health"),
+        ] {
+            let _ = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let now = crate::metrics::unix_now();
+        let points = metrics
+            .xrpc()
+            .read(
+                &pool,
+                crate::db::DatabaseBackend::Sqlite,
+                now,
+                now - 3_600,
+                now + 3_600,
+                3_600,
+            )
+            .await
+            .unwrap();
+        let total: u64 = points.iter().map(|p| p.requests).sum();
+        assert_eq!(
+            total, 2,
+            "the two XRPC calls, not /health, with script metrics off"
+        );
+    }
+
+    #[tokio::test]
     async fn xrpc_request_under_a_configured_base_path_still_increments_xrpc_requests() {
         let counters = Arc::new(Counters::new());
         let telemetry_state = TelemetryState {
             counters: counters.clone(),
             base_path: Some("/happyview".to_string()),
+            metrics: None,
         };
         let app = Router::new()
             .route("/happyview/xrpc/com.example.probe", get(|| async { "ok" }))

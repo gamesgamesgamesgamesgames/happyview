@@ -6,6 +6,7 @@
 //! [`persist`] writes the minutes that have closed, and a restart reads the
 //! last day back.
 
+pub mod counter;
 pub mod delivered;
 pub mod ingest;
 pub mod instance;
@@ -16,6 +17,7 @@ pub mod run;
 pub mod sketch;
 pub mod stages;
 pub mod window;
+pub mod xrpc;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -294,6 +296,8 @@ pub struct ScriptMetrics {
     instance: String,
     /// Records delivered, counted whether or not the rest is on.
     delivered: delivered::Delivered,
+    /// XRPC requests, likewise.
+    xrpc: xrpc::XrpcRequests,
 }
 
 impl Default for ScriptMetrics {
@@ -308,6 +312,7 @@ impl Default for ScriptMetrics {
             persisted_to: AtomicU64::new(0),
             instance: instance::this_process().to_string(),
             delivered: delivered::Delivered::default(),
+            xrpc: xrpc::XrpcRequests::default(),
         }
     }
 }
@@ -424,6 +429,11 @@ impl ScriptMetrics {
     /// Records delivered, by origin.
     pub fn delivered(&self) -> &delivered::Delivered {
         &self.delivered
+    }
+
+    /// XRPC requests, by method kind.
+    pub fn xrpc(&self) -> &xrpc::XrpcRequests {
+        &self.xrpc
     }
 
     /// One record from `origin` handed to ingest now. Counted whether or
