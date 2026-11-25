@@ -107,6 +107,18 @@ impl Delivered {
                 backend,
             );
             let mut tx = crate::db::begin_write(pool, backend).await?;
+            // Another process writing under the same instance id adds to the
+            // same rows: on Postgres, take turns, so neither read goes stale.
+            // SQLite's write transaction already excludes the other.
+            if backend == DatabaseBackend::Postgres {
+                crate::db::query(&adapt_sql(
+                    "SELECT pg_advisory_xact_lock(hashtext(?))",
+                    backend,
+                ))
+                .bind(format!("happyview_delivered:{instance}"))
+                .execute(&mut *tx)
+                .await?;
+            }
             for (minute, counts) in &closed {
                 for (i, n) in counts.iter().enumerate() {
                     if *n == 0 {

@@ -858,8 +858,12 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
                 // The delivery this retries failed open and stored the body
                 // as it arrived; the hook now says it should not be there.
                 HookedBody::Skip if ev.origin == Origin::Retry => {
+                    let outcome = remove_failed_open(state, ev, rec, &uri).await;
+                    let removed =
+                        !matches!(outcome, IngestOutcome::Errored | IngestOutcome::Unavailable);
+                    let timer = if removed { timer } else { timer.undelivered() };
                     timer.finish(&state.metrics, None);
-                    return remove_failed_open(state, ev, rec, &uri).await;
+                    return outcome;
                 }
                 HookedBody::Skip | HookedBody::CidMismatch => {
                     timer.finish(&state.metrics, None);
