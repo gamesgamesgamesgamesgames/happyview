@@ -70,10 +70,11 @@ pub(crate) fn space_uri(space: &Space) -> String {
 
 /// A space's reference under both names it has had: `uri` (Oct 29) and
 /// `space` (Nov 12). The lexicons' objects are open, so each generation's
-/// client reads its own and ignores the other.
-pub(crate) fn space_ref_body(space: &Space) -> serde_json::Value {
+/// client reads its own and ignores the other. `uri` keeps the `at://` form
+/// its clients read; `space` is in `form`.
+pub(crate) fn space_ref_body(space: &Space, form: crate::spaces::UriForm) -> serde_json::Value {
     let uri = space_uri(space);
-    serde_json::json!({ "uri": uri, "space": uri })
+    serde_json::json!({ "uri": uri, "space": form.write(&uri) })
 }
 
 async fn resolve(state: &AppState, space: &str) -> Result<Space, AppError> {
@@ -164,7 +165,12 @@ async fn create_space(
         },
         e => e,
     })?;
-    Ok(Json(space_ref_body(&space)))
+    // A new space is named in the current form, as nothing in the request
+    // says otherwise.
+    Ok(Json(space_ref_body(
+        &space,
+        crate::spaces::UriForm::AtSpace,
+    )))
 }
 
 /// Replace a space's policy wholesale. A policy of another `$type` migrates
@@ -201,7 +207,7 @@ async fn get_space(
     let space = resolve(&state, &query.space).await?;
     authorize_reader(&state, &claims, &space).await?;
     let policy = SpacePolicy::of(&space)?;
-    let mut body = space_ref_body(&space);
+    let mut body = space_ref_body(&space, crate::spaces::UriForm::of(&query.space));
     body["policy"] = serde_json::to_value(policy)
         .map_err(|e| AppError::Internal(format!("failed to encode policy: {e}")))?;
     Ok(Json(body))

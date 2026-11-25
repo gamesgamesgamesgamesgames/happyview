@@ -87,7 +87,7 @@ pub(crate) async fn verify_space_credential(
         "at://{}/space/{}/{}",
         space.did, space.type_nsid, space.skey
     );
-    if claims.sub != space_uri {
+    if !crate::spaces::same_space_uri(&claims.sub, &space_uri) {
         return Err(AppError::XrpcError {
             status: axum::http::StatusCode::BAD_REQUEST,
             code: "InvalidCredential",

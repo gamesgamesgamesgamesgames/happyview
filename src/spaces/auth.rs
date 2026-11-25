@@ -58,6 +58,7 @@ pub async fn issue_credential(
         authority_did,
         bound_key,
         crate::spaces::authority::SIGNING_KID,
+        crate::spaces::UriForm::Legacy,
     )
     .await
 }
@@ -79,6 +80,9 @@ pub async fn issue_credential_as(
     authority_did: &str,
     bound_key: Option<&str>,
     kid: &str,
+    // The form the credential names its space in (`sub`): the form the
+    // request did, so the repo hosts it is shown to read it as they write it.
+    uri_form: crate::spaces::UriForm,
 ) -> Result<IssuedCredential, AppError> {
     let auth_ctx = ServiceAuthCtx {
         pool,
@@ -105,10 +109,10 @@ pub async fn issue_credential_as(
 
     let claims = SpaceCredentialClaims {
         iss: space.authority_did.clone(),
-        sub: format!(
+        sub: uri_form.write(&format!(
             "at://{}/space/{}/{}",
             space.did, space.type_nsid, space.skey
-        ),
+        )),
         iat: now,
         exp,
         jti: make_jti(),

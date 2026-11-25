@@ -940,7 +940,7 @@ async fn list_spaces(
         .map(|v| {
             let mut view = serde_json::json!({
                 "uri": v.uri,
-                "space": v.uri,
+                "space": crate::spaces::UriForm::AtSpace.write(&v.uri),
                 "isOwner": v.is_owner,
             });
             if let Some(rev) = v.repo_rev {
@@ -1025,6 +1025,7 @@ async fn create_record(
         input.record,
     )
     .await?;
+    let uri = crate::spaces::UriForm::of(&input.space).write(&uri);
     let mut response = Json(serde_json::json!({ "uri": uri, "cid": cid })).into_response();
     *response.status_mut() = StatusCode::CREATED;
     Ok(response)
@@ -1061,6 +1062,7 @@ async fn put_record(
         input.swap_record,
     )
     .await?;
+    let uri = crate::spaces::UriForm::of(&input.space).write(&uri);
     let mut response = Json(serde_json::json!({ "uri": uri, "cid": cid })).into_response();
     *response.status_mut() = StatusCode::CREATED;
     Ok(response)
@@ -1249,7 +1251,7 @@ async fn apply_writes(
                     old_cid: None,
                 });
                 results.push(serde_json::json!({
-                    "uri": record_uri,
+                    "uri": crate::spaces::UriForm::of(&input.space).write(&record_uri),
                     "cid": cid,
                 }));
             }
@@ -1308,7 +1310,7 @@ async fn apply_writes(
                     old_cid,
                 });
                 results.push(serde_json::json!({
-                    "uri": record_uri,
+                    "uri": crate::spaces::UriForm::of(&input.space).write(&record_uri),
                     "cid": cid,
                 }));
             }
@@ -1596,7 +1598,7 @@ async fn get_record(
     .await?;
 
     Ok(Json(serde_json::json!({
-        "uri": record.uri,
+        "uri": crate::spaces::UriForm::of(&query.space).write(&record.uri),
         "cid": record.cid,
         "value": record.record,
     })))
@@ -1844,7 +1846,9 @@ async fn get_delegation_token(
     let space_host = format!("{}#atproto_pds", space.did);
     let delegation_claims = crate::spaces::credential::DelegationTokenClaims {
         iss: did,
-        sub: space_uri,
+        // In the form the request named the space in; any form is accepted
+        // back (`same_space_uri`).
+        sub: crate::spaces::UriForm::of(&params.space).write(&space_uri),
         aud: space_host,
         iat: now,
         exp,
@@ -1952,8 +1956,12 @@ async fn get_latest_commit(
     // RepoNotFound, since their commit is required.
     let repo_state = db::read_repo_state(&mut conn, state.db_backend, &space.id, &repo).await?;
     if named == RepoParam::Repo {
-        let commit = lexicon_commit(repo_state.as_ref(), &repo, &space_ref(&space))?
-            .ok_or_else(|| repo_not_found(&repo))?;
+        let commit = lexicon_commit(
+            repo_state.as_ref(),
+            &repo,
+            &crate::spaces::UriForm::of(&params.space).write(&space_ref(&space)),
+        )?
+        .ok_or_else(|| repo_not_found(&repo))?;
         return Ok(Json(serde_json::json!({
             "commit": lexicon_commit_json(&commit),
             // HappyView's earlier field, the same as commit.rev.
@@ -2009,8 +2017,12 @@ async fn get_repo(
         // The lexicons' archive: STAR, with the commit as its metadata.
         let repo_state = db::read_repo_state(&mut conn, state.db_backend, &space.id, &repo).await?;
         drop(conn);
-        let commit = lexicon_commit(repo_state.as_ref(), &repo, &space_ref(&space))?
-            .ok_or_else(|| repo_not_found(&repo))?;
+        let commit = lexicon_commit(
+            repo_state.as_ref(),
+            &repo,
+            &crate::spaces::UriForm::of(&params.space).write(&space_ref(&space)),
+        )?
+        .ok_or_else(|| repo_not_found(&repo))?;
         let records =
             db::list_all_space_records(&state.db, state.db_backend, &space.id, &repo).await?;
         let star = crate::spaces::star_repo::serialize_repo(&commit, &records)?;
@@ -2132,7 +2144,7 @@ async fn list_repo_ops(
     let exclude_values = params.exclude_values.unwrap_or(false);
     // The lexicons' commit is required, so a repo never written is not found.
     // Checked before listing: there is nothing to list.
-    let canonical = space_ref(&space);
+    let canonical = crate::spaces::UriForm::of(&params.space).write(&space_ref(&space));
     if named == RepoParam::Repo {
         let mut conn = state
             .db
@@ -2864,6 +2876,7 @@ async fn get_space_credential(
         &space.authority_did,
         Some(credential_key),
         generation.signing_kid(),
+        crate::spaces::UriForm::of(&input.space),
     )
     .await
     .map_err(|e| match e {
@@ -3020,7 +3033,7 @@ async fn verify_delegation(
         .await
         .map_err(|e| invalid(e.to_string()))?,
     };
-    if claims.sub != space_uri {
+    if !crate::spaces::same_space_uri(&claims.sub, space_uri) {
         return Err(invalid("delegation token is for a different space".into()));
     }
     if !db::consume_delegation_token(

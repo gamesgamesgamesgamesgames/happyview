@@ -525,13 +525,15 @@ async fn put_member(
         read_self: false,
     };
     let space = canonical_ref(&state, &input.space).await?;
+    // A space named as a member is stored in the form HappyView compares.
+    let member_ref = crate::spaces::canonical_uri(&input.did);
     // A space named as a member is a nested space (HAP-388 H5).
-    let member = if names_space(input.is_delegation, &input.did) {
+    let member = if names_space(input.is_delegation, &member_ref) {
         crate::spaces::nested::put_space_member(
             &state,
             claims.did(),
             &space,
-            &input.did,
+            &member_ref,
             Some(access),
             input.is_delegation,
             false,
@@ -542,7 +544,7 @@ async fn put_member(
             &state,
             claims.did(),
             &space,
-            &input.did,
+            &member_ref,
             Some(access),
             input.is_delegation,
         )
@@ -580,12 +582,13 @@ async fn add_member(
         });
     }
     let space = canonical_ref(&state, &input.space).await?;
-    let member = if names_space(input.is_delegation, &input.did) {
+    let member_ref = crate::spaces::canonical_uri(&input.did);
+    let member = if names_space(input.is_delegation, &member_ref) {
         crate::spaces::nested::put_space_member(
             &state,
             claims.did(),
             &space,
-            &input.did,
+            &member_ref,
             access,
             input.is_delegation,
             true,
@@ -596,7 +599,7 @@ async fn add_member(
             &state,
             claims.did(),
             &space,
-            &input.did,
+            &member_ref,
             access,
             input.is_delegation,
         )
@@ -614,11 +617,12 @@ async fn remove_member(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = require_auth(&xrpc_claims)?;
     let space = canonical_ref(&state, &input.space).await?;
-    crate::spaces::nested::remove_space_member(&state, claims.did(), &space, &input.did).await?;
+    let member_ref = crate::spaces::canonical_uri(&input.did);
+    crate::spaces::nested::remove_space_member(&state, claims.did(), &space, &member_ref).await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
 /// Whether a member entry names a space rather than an account.
 fn names_space(is_delegation: Option<bool>, member: &str) -> bool {
-    is_delegation == Some(true) || member.starts_with("at://") || member.starts_with("ats://")
+    is_delegation == Some(true) || crate::spaces::is_space_reference(member)
 }
