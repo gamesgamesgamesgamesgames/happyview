@@ -240,6 +240,19 @@ async fn a_commit_names_its_space_as_asked() {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["commit"]["space"], asked.as_str(), "{body}");
+
+        let (status, body) = get(
+            &app,
+            MEMBER,
+            &format!(
+                "/xrpc/com.atproto.space.listRepoOps?space={}&repo={}",
+                urlencoding::encode(&asked),
+                urlencoding::encode(MEMBER)
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["commit"]["space"], asked.as_str(), "{body}");
     }
 }
 
@@ -400,4 +413,49 @@ async fn a_space_named_as_a_member_is_kept_in_the_form_compared() {
         .matches(child["uri"].as_str().unwrap())
         .count();
     assert_eq!(count, 1, "{listed}");
+}
+
+/// A space that isn't a memberspace, named as a member, is stored as an entry
+/// naming it, in the form HappyView compares, so naming it again in the other
+/// form is the same entry.
+#[tokio::test]
+#[serial]
+async fn an_entry_naming_a_space_is_stored_in_the_form_compared() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let parent = setup(&mut app).await;
+    let (status, managed) = post(
+        &app,
+        CREATOR,
+        "com.atproto.space.createSpace",
+        json!({
+            "spaceType": TYPE_NSID,
+            "skey": format!("m{}", Uuid::new_v4().simple()),
+            "policy": { "$type": "com.atproto.managedspace.policy", "managingApp": "did:plc:someapp#app" },
+        }),
+    )
+    .await;
+    assert!(status.is_success(), "{managed}");
+
+    let (status, body) = post(
+        &app,
+        CREATOR,
+        "com.atproto.simplespace.addMember",
+        json!({ "space": parent["uri"], "did": managed["space"], "isDelegation": true }),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    assert_eq!(
+        body["member"]["did"], managed["uri"],
+        "stored in the at:// form: {body}"
+    );
+
+    let (status, body) = post(
+        &app,
+        CREATOR,
+        "com.atproto.simplespace.addMember",
+        json!({ "space": parent["uri"], "did": managed["uri"], "isDelegation": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "the same entry: {body}");
 }

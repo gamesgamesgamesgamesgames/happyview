@@ -548,7 +548,11 @@ async fn revocation_reaches_the_native_host(revoke: impl Fn(&str) -> (&'static s
         .unwrap();
         claims["jti"].clone()
     };
-    assert_eq!(body["space"], json!(space));
+    // Sent in the current form, `at:space/`.
+    assert_eq!(
+        body["space"],
+        json!(happyview::spaces::UriForm::AtSpace.write(&space))
+    );
     assert_eq!(body["credentials"], json!([jti]));
     // The space has a DID of its own, and revokes as it.
     assert!(authority.starts_with("did:plc:"), "{authority}");
@@ -636,7 +640,7 @@ async fn list_spaces_gives_the_space_revision_to_its_owner_only() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|v| v["space"] == json!(space))
+                .find(|v| v["uri"] == json!(space))
                 .cloned()
                 .expect("listed")
         }
@@ -1404,7 +1408,10 @@ async fn a_revocation_through_a_delegation_entry_notifies_the_hosts_of_native_re
         .unwrap();
         claims["jti"].clone()
     };
-    assert_eq!(body["space"], json!(outer));
+    assert_eq!(
+        body["space"],
+        json!(happyview::spaces::UriForm::AtSpace.write(&outer))
+    );
     assert_eq!(body["credentials"], json!([jti]));
     let authorization = received[0]
         .headers

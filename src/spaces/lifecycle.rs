@@ -307,8 +307,15 @@ mod tests {
         )
         .await
         .map(|Json(body)| {
-            assert_eq!(body["uri"], body["space"], "both names carry the reference");
-            body["space"].as_str().unwrap().to_string()
+            // Both names carry the reference: `uri` in the `at://` form its
+            // clients read, `space` in the current form.
+            let uri = body["uri"].as_str().unwrap().to_string();
+            assert_eq!(
+                body["space"],
+                serde_json::json!(crate::spaces::UriForm::AtSpace.write(&uri)),
+                "{body}"
+            );
+            uri
         })
     }
 

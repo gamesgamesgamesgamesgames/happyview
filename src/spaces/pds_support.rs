@@ -1011,6 +1011,11 @@ mod tests {
             let (result, sent) = sent_to(&state, Some(PDS), earlier_only).await;
             assert!(result.is_ok());
             assert_eq!(sent, [SPACE]);
+
+            // A refusal in the earlier form isn't asked again.
+            let (result, sent) = sent_to(&state, Some(PDS), |_| Err(refusal())).await;
+            assert!(result.is_err());
+            assert_eq!(sent, [SPACE]);
         }
 
         #[tokio::test]
