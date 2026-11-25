@@ -454,12 +454,13 @@ pub async fn remember_legacy_space_uri(
     Ok(())
 }
 
-/// Whether a host's refusal is of the space URI's form: an `InvalidRequest`
-/// that names the space. A host that predates `at:space/` refuses one as a
-/// malformed space reference.
+/// Whether a host's refusal is of the space URI's form. A host that predates
+/// `at:space/` refuses one as a malformed space reference: an
+/// `InvalidRequest` that names the space, or (the reference PDS before the
+/// change) `InvalidSpaceUri`.
 pub fn refuses_space_uri_form(err: &AppError) -> bool {
     let text = err.to_string().to_ascii_lowercase();
-    text.contains("invalidrequest") && text.contains("space")
+    text.contains("invalidspaceuri") || (text.contains("invalidrequest") && text.contains("space"))
 }
 
 /// Call a PDS with a space URI in the form it takes. A host not known to
@@ -1051,6 +1052,21 @@ mod tests {
             })
             .await;
             assert_eq!(sent, [NEW, SPACE]);
+        }
+
+        #[test]
+        fn refusals_of_the_form_are_recognised() {
+            assert!(refuses_space_uri_form(&refusal()));
+            // The reference PDS before `at:space/`.
+            assert!(refuses_space_uri_form(&AppError::Internal(
+                r#"PDS request failed: xrpc response error: 400 {"error":"InvalidSpaceUri","message":"Not a space uri: at:space/did:plc:a/com.example.forum/main"}"#.into()
+            )));
+            assert!(!refuses_space_uri_form(&AppError::Internal(
+                "PDS query failed: InvalidRequest: missing collection".into()
+            )));
+            assert!(!refuses_space_uri_form(&AppError::Internal(
+                "PDS query failed: SpaceNotFound".into()
+            )));
         }
     }
 }
