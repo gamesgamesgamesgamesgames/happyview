@@ -717,14 +717,6 @@ fn named_repo(repo: Option<&str>, did: Option<&str>) -> Result<(String, RepoPara
     }
 }
 
-fn bad_request(code: &'static str, message: String) -> AppError {
-    AppError::XrpcError {
-        status: StatusCode::BAD_REQUEST,
-        code,
-        message,
-    }
-}
-
 fn repo_not_found(repo: &str) -> AppError {
     bad_request(
         "RepoNotFound",
