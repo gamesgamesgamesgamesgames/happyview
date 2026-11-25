@@ -142,6 +142,37 @@ mod tests {
 // OAuth `space:` scope enforcement
 // ---------------------------------------------------------------------------
 
+/// The repo a `clearRecords` would empty, as its grant check needs to know it.
+pub enum ClearedRepo<'a> {
+    /// Held here: these are the collections it holds.
+    Here(&'a [String]),
+    /// Held on the author's PDS. HappyView's copy may not list every
+    /// collection the PDS holds, so the grant must cover them all.
+    OnPds,
+}
+
+/// The grants `clearRecords` needs: `delete` on every collection it removes.
+pub async fn require_clear_scope(
+    state: &AppState,
+    claims: &Claims,
+    space: &Space,
+    repo: ClearedRepo<'_>,
+) -> Result<(), AppError> {
+    let delete = |collection| SpaceTarget::Write {
+        action: happyview_scopes::SpaceAction::Delete,
+        collection,
+    };
+    match repo {
+        ClearedRepo::OnPds => require_space_scope(state, claims, space, delete("*")).await,
+        ClearedRepo::Here(collections) => {
+            for collection in collections {
+                require_space_scope(state, claims, space, delete(collection)).await?;
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Refuse the request unless the caller's session holds a covering `space:` grant.
 ///
 /// Two independent gates guard a space, and both must pass: the member list says
@@ -666,5 +697,79 @@ pub(crate) mod space_scope_gate_tests {
         require_space_scope(&state, &claims, &a_space(), SpaceTarget::Read)
             .await
             .expect("a cookie session has no scope to check");
+    }
+
+    #[tokio::test]
+    async fn clearing_a_repo_here_needs_a_delete_on_each_collection_it_holds() {
+        let state = test_state().await;
+        let space = a_space();
+        let held = [
+            "com.example.post".to_string(),
+            "com.example.like".to_string(),
+        ];
+        let both = session_with_scopes(
+            &state,
+            &format!(
+                "space:com.example.forum?authority={USER}&collection=com.example.post&collection=com.example.like&action=delete"
+            ),
+        )
+        .await;
+        require_clear_scope(&state, &both, &space, ClearedRepo::Here(&held))
+            .await
+            .expect("a delete on every collection held clears the repo");
+
+        let one = session_with_scopes(
+            &state,
+            &format!(
+                "space:com.example.forum?authority={USER}&collection=com.example.post&action=delete"
+            ),
+        )
+        .await;
+        assert!(
+            require_clear_scope(&state, &one, &space, ClearedRepo::Here(&held))
+                .await
+                .is_err(),
+            "a collection without a delete grant blocks the clear"
+        );
+
+        let create_only = session_with_scopes(
+            &state,
+            &format!("space:com.example.forum?authority={USER}&collection=*&action=create"),
+        )
+        .await;
+        assert!(
+            require_clear_scope(&state, &create_only, &space, ClearedRepo::Here(&held))
+                .await
+                .is_err(),
+            "a grant without delete clears nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_a_repo_on_its_pds_needs_a_delete_on_every_collection() {
+        let state = test_state().await;
+        let space = a_space();
+        let named = session_with_scopes(
+            &state,
+            &format!(
+                "space:com.example.forum?authority={USER}&collection=com.example.post&action=delete"
+            ),
+        )
+        .await;
+        assert!(
+            require_clear_scope(&state, &named, &space, ClearedRepo::OnPds)
+                .await
+                .is_err(),
+            "HappyView can't see every collection on the PDS, so named ones aren't enough"
+        );
+
+        let every = session_with_scopes(
+            &state,
+            &format!("space:com.example.forum?authority={USER}&collection=*&action=delete"),
+        )
+        .await;
+        require_clear_scope(&state, &every, &space, ClearedRepo::OnPds)
+            .await
+            .expect("a delete on every collection clears a repo on its PDS");
     }
 }

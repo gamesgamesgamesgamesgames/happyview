@@ -25,6 +25,7 @@ happyview-provider = { path = "crates/happyview-provider" }
 happyview-source-jetstream = { path = "crates/happyview-source-jetstream" }
 happyview-plugin-sdk = { path = "crates/happyview-plugin-sdk" }
 happyview-scopes = { path = "crates/happyview-scopes" }
+happyview-star = { path = "crates/happyview-star" }
 
 [package]
 name = "happyview"
@@ -71,6 +72,7 @@ happyview-provider = { workspace = true }
 happyview-source-jetstream = { workspace = true }
 happyview-plugin-sdk = { workspace = true }
 happyview-scopes = { workspace = true }
+happyview-star = { workspace = true }
 hex = "0.4"
 full_moon = { version = "2", features = ["lua54"] }
 futures-util = "0.3"

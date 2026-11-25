@@ -1721,6 +1721,55 @@ pub async fn upsert_space_record_with_swap(
     Ok(())
 }
 
+/// One repo's records as `(uri, collection, rkey, cid)`, read on `conn` so a
+/// write transaction sees the records it holds the space's lock over.
+pub async fn list_space_record_keys(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+    author_did: &str,
+) -> Result<Vec<(String, String, String, String)>, AppError> {
+    let sql = adapt_sql(
+        "SELECT uri, collection, rkey, cid FROM happyview_space_records WHERE space_id = ? AND author_did = ? ORDER BY collection, rkey",
+        backend,
+    );
+    crate::db::query_as(&sql)
+        .bind(space_id)
+        .bind(author_did)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list space records: {e}")))
+}
+
+/// Delete every record `author_did` holds in a space except those in `keep`,
+/// in one statement.
+pub async fn delete_space_records_except(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space_id: &str,
+    author_did: &str,
+    keep: &[&str],
+) -> Result<u64, AppError> {
+    let mut sql =
+        "DELETE FROM happyview_space_records WHERE space_id = ? AND author_did = ?".to_string();
+    if !keep.is_empty() {
+        sql.push_str(&format!(
+            " AND collection NOT IN ({})",
+            vec!["?"; keep.len()].join(", ")
+        ));
+    }
+    let sql = adapt_sql(&sql, backend);
+    let mut query = crate::db::query(&sql).bind(space_id).bind(author_did);
+    for collection in keep {
+        query = query.bind(*collection);
+    }
+    query
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|e| AppError::Internal(format!("failed to clear space records: {e}")))
+}
+
 pub async fn delete_space_record(
     executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
