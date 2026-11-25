@@ -190,6 +190,82 @@ pub(super) async fn ingest(
     Ok(Json(body))
 }
 
+/// The longest range `delivered` reads at once.
+const MAX_DELIVERED_DAYS: u64 = 31;
+
+#[derive(Deserialize)]
+pub struct DeliveredQuery {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub step: Option<String>,
+}
+
+fn time_of(raw: &str, name: &str) -> Result<u64, AppError> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .and_then(|t| u64::try_from(t.timestamp()).ok())
+        .ok_or_else(|| AppError::BadRequest(format!("{name} '{raw}' is not an RFC 3339 time")))
+}
+
+/// GET /admin/metrics/delivered — the records ingest was handed, by origin,
+/// per UTC hour or day (`step=1h` or `step=1d`, the default) from `from` up
+/// to `to` (default now). Both are aligned down to the step. `enabled` is
+/// false while script metrics are off, when nothing is counted.
+pub(super) async fn delivered(
+    State(state): State<AppState>,
+    AllowPlatform(auth): AllowPlatform,
+    Query(query): Query<DeliveredQuery>,
+) -> Result<Json<Value>, AppError> {
+    auth.require(Permission::MetricsRead).await?;
+    let step = match query.step.as_deref() {
+        None => Step::Day,
+        Some(raw) => match Step::parse(raw) {
+            Some(step @ (Step::Hour | Step::Day)) => step,
+            _ => {
+                return Err(AppError::BadRequest(format!(
+                    "step '{raw}' is not one of 1h and 1d"
+                )));
+            }
+        },
+    };
+    let now = unix_now();
+    let Some(from) = query.from.as_deref() else {
+        return Err(AppError::BadRequest("from is required".into()));
+    };
+    let from = time_of(from, "from")?;
+    let to = match query.to.as_deref() {
+        // Up to the end of the step still open.
+        None => now - now % step.secs() + step.secs(),
+        Some(raw) => time_of(raw, "to")?,
+    };
+    if to < from {
+        return Err(AppError::BadRequest("to is before from".into()));
+    }
+    if to - from > MAX_DELIVERED_DAYS * 86_400 {
+        return Err(AppError::BadRequest(format!(
+            "the range may be at most {MAX_DELIVERED_DAYS} days"
+        )));
+    }
+    let points = persist::delivered(
+        &state.metrics,
+        &state.db,
+        state.db_backend,
+        now,
+        from,
+        to,
+        step.secs(),
+    )
+    .await
+    .map_err(read_failed)?;
+    let mut body = json!({
+        "step": step.as_str(),
+        "enabled": state.metrics.enabled(),
+        "points": points,
+    });
+    stored_fields(&state, Window::Month, None, &mut body).await;
+    Ok(Json(body))
+}
+
 /// GET /admin/metrics/live — what is running now.
 pub(super) async fn live(
     State(state): State<AppState>,

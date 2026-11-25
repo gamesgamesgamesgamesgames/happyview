@@ -30,9 +30,11 @@ use crate::plugin::{ExecutionError, ScriptExecuteOutput, ScriptKind};
 use crate::script::DispatchError;
 
 use happyview_provider::JobHookStats;
+pub use ingest::RecordOrigin;
 use ingest::{IngestBucket, IngestSummary, RecordSample};
 use job::JobStats;
 use run::RunTimings;
+use window::Accumulate as _;
 use window::{Bucket, History, Stats};
 
 pub const ENABLED_KEY: &str = "script_metrics_enabled";
@@ -269,12 +271,13 @@ fn gauge_index(kind: ScriptKind) -> Option<usize> {
 struct IngestKey {
     collection: String,
     action: &'static str,
+    origin: RecordOrigin,
 }
 
 pub struct ScriptMetrics {
     enabled: AtomicBool,
     keys: RwLock<HashMap<Key, Arc<Mutex<History>>>>,
-    /// Ingest's records, by collection and action. Bounded by [`MAX_KEYS`]
+    /// Ingest's records, by collection, action and origin. Bounded by [`MAX_KEYS`]
     /// as the scripts are, and counted in the same overflow.
     ingest: RwLock<HashMap<IngestKey, Arc<Mutex<History<IngestBucket>>>>>,
     /// Backfill jobs' hook stats, by job id. Few jobs run at once, and each
@@ -619,19 +622,21 @@ impl ScriptMetrics {
         &self,
         collection: &str,
         action: &'static str,
+        origin: RecordOrigin,
         job: Option<&str>,
         sample: &RecordSample,
     ) {
-        self.record_ingest_at(unix_now_ms(), collection, action, job, sample);
+        self.record_ingest_at(unix_now_ms(), collection, action, origin, job, sample);
     }
 
-    /// One record of `collection`'s `action`, finished at `at_ms`, added to
-    /// its windows and to backfill job `job`'s stats.
+    /// One record of `collection`'s `action` from `origin`, finished at
+    /// `at_ms`, added to its windows and to backfill job `job`'s stats.
     pub fn record_ingest_at(
         &self,
         at_ms: u64,
         collection: &str,
         action: &'static str,
+        origin: RecordOrigin,
         job: Option<&str>,
         sample: &RecordSample,
     ) {
@@ -645,6 +650,7 @@ impl ScriptMetrics {
         let key = IngestKey {
             collection: collection.to_string(),
             action,
+            origin,
         };
         let held = self
             .ingest
@@ -670,19 +676,27 @@ impl ScriptMetrics {
     }
 
     /// Every collection and action that saw records inside `window` ending
-    /// at `now`, busiest first.
+    /// at `now`, busiest first, every origin's records together.
     pub fn ingest_at(&self, now: u64, window: Window) -> Vec<IngestSummary> {
-        let mut out: Vec<IngestSummary> = self
-            .ingest_entries()
+        let mut merged: HashMap<(String, &'static str), (IngestBucket, u64)> = HashMap::new();
+        for (key, history) in self.ingest_entries() {
+            let history = history.lock().unwrap_or_else(|e| e.into_inner());
+            let ring = ring_for(&history, window);
+            let Some(oldest) = ring.oldest_in(now, window.secs()) else {
+                continue;
+            };
+            let bucket = ring.merged(now, window.secs());
+            let (held, first) = merged
+                .entry((key.collection, key.action))
+                .or_insert_with(|| (IngestBucket::default(), oldest));
+            held.merge_from(&bucket);
+            *first = (*first).min(oldest);
+        }
+        let mut out: Vec<IngestSummary> = merged
             .into_iter()
-            .filter_map(|(key, history)| {
-                let history = history.lock().unwrap_or_else(|e| e.into_inner());
-                let ring = ring_for(&history, window);
-                let bucket = ring.merged(now, window.secs());
-                let oldest = ring.oldest_in(now, window.secs())?;
-                (bucket.records > 0).then(|| {
-                    bucket.summary(&key.collection, key.action, now.saturating_sub(oldest) + 1)
-                })
+            .filter(|(_, (bucket, _))| bucket.records > 0)
+            .map(|((collection, action), (bucket, oldest))| {
+                bucket.summary(&collection, action, now.saturating_sub(oldest) + 1)
             })
             .collect();
         sort_ingest(&mut out);

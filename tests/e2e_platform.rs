@@ -863,6 +863,20 @@ async fn platform_key_can_read_script_and_ingest_metrics() {
             .any(|s| s["trigger"].as_str() == Some(METRICS_TRIGGER)),
         "{body}"
     );
+
+    // The usage meter's read.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bearer(
+            Method::GET,
+            "/admin/metrics/delivered?from=2026-11-01T00:00:00Z&to=2026-11-02T00:00:00Z&step=1h",
+            PLATFORM_KEY,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 /// `metrics:read` opens only the routes that opt in with `AllowPlatform`: the

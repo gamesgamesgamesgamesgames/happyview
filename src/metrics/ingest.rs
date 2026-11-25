@@ -53,6 +53,64 @@ impl RecordDecision {
     }
 }
 
+/// Where a record handed to ingest came from, as its metrics key keeps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RecordOrigin {
+    /// A live event: the firehose, or a store feed row that isn't a crawl.
+    Live,
+    /// A backfill: a crawl of the network or of a repo, or a store crawl the
+    /// feed delivered.
+    Backfill,
+    /// A store pass: a backfill job that read the shared store's copy of a
+    /// collection rather than crawling it.
+    StorePass,
+    /// A dead-lettered record run again.
+    Retry,
+    /// Written before origins were kept.
+    Unknown,
+}
+
+/// Every origin's name, in [`RecordOrigin::index`] order.
+pub const ORIGINS: [&str; 5] = ["live", "backfill", "store_pass", "retry", "unknown"];
+
+/// The job id the network store's feed gives the crawl rows it delivers.
+/// A backfill from the store with any other job id is a store pass.
+const STORE_FEED_JOB: &str = "network_store";
+
+impl RecordOrigin {
+    pub fn of(ev: &RecordEvent) -> Self {
+        match &ev.origin {
+            Origin::Live => Self::Live,
+            Origin::Retry => Self::Retry,
+            Origin::Backfill { job_id } if ev.stored && job_id != STORE_FEED_JOB => Self::StorePass,
+            Origin::Backfill { .. } => Self::Backfill,
+        }
+    }
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn as_str(self) -> &'static str {
+        ORIGINS[self.index()]
+    }
+
+    /// The origin named `name`; a name this build doesn't know is
+    /// [`Unknown`](Self::Unknown).
+    pub fn parse(name: &str) -> Self {
+        [
+            Self::Live,
+            Self::Backfill,
+            Self::StorePass,
+            Self::Retry,
+            Self::Unknown,
+        ]
+        .into_iter()
+        .find(|o| o.as_str() == name)
+        .unwrap_or(Self::Unknown)
+    }
+}
+
 /// One record, finished.
 #[derive(Clone, Debug)]
 pub struct RecordSample {
@@ -142,6 +200,7 @@ pub struct RecordTimer(Option<Box<Timing>>);
 struct Timing {
     collection: String,
     action: &'static str,
+    origin: RecordOrigin,
     job: Option<String>,
     started: Instant,
     collector: Arc<RecordCollector>,
@@ -159,6 +218,7 @@ impl RecordTimer {
         Self(Some(Box::new(Timing {
             collection: ev.key.collection.clone(),
             action: ev.action.as_str(),
+            origin: RecordOrigin::of(ev),
             job: match &ev.origin {
                 Origin::Backfill { job_id } => Some(job_id.clone()),
                 Origin::Live | Origin::Retry => None,
@@ -230,6 +290,7 @@ impl RecordTimer {
         let Timing {
             collection,
             action,
+            origin,
             job,
             started,
             collector,
@@ -254,7 +315,7 @@ impl RecordTimer {
             dead_lettered: times.dead_lettered,
         };
         drop(times);
-        metrics.record_ingest(&collection, action, job.as_deref(), &sample);
+        metrics.record_ingest(&collection, action, origin, job.as_deref(), &sample);
     }
 }
 
@@ -447,6 +508,32 @@ mod tests {
         assert_eq!(job.done, 1);
         assert_eq!(job.failed, 1);
         assert_eq!(job.outcomes["replace"], 1);
+    }
+
+    #[test]
+    fn an_origin_tells_a_store_pass_from_the_feed_and_a_crawl() {
+        let backfill = |job: &str, stored| RecordEvent {
+            stored,
+            ..event(Origin::Backfill { job_id: job.into() })
+        };
+        assert_eq!(RecordOrigin::of(&event(Origin::Live)), RecordOrigin::Live);
+        assert_eq!(RecordOrigin::of(&event(Origin::Retry)), RecordOrigin::Retry);
+        assert_eq!(
+            RecordOrigin::of(&backfill("job", false)),
+            RecordOrigin::Backfill
+        );
+        assert_eq!(
+            RecordOrigin::of(&backfill(STORE_FEED_JOB, true)),
+            RecordOrigin::Backfill
+        );
+        assert_eq!(
+            RecordOrigin::of(&backfill("job", true)),
+            RecordOrigin::StorePass
+        );
+        for name in ORIGINS {
+            assert_eq!(RecordOrigin::parse(name).as_str(), name);
+        }
+        assert_eq!(RecordOrigin::parse("elsewhere"), RecordOrigin::Unknown);
     }
 
     #[tokio::test]

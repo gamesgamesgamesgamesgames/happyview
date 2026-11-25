@@ -22,7 +22,9 @@ use common::echo_interpreter;
 use happyview::metrics::ingest::{RecordDecision, RecordSample};
 use happyview::metrics::persist::{self, Persister};
 use happyview::metrics::run::RunTimings;
-use happyview::metrics::{Layer, Outcome, RunSample, ScriptMetrics, Window, unix_now};
+use happyview::metrics::{
+    Layer, Outcome, RecordOrigin, RunSample, ScriptMetrics, Window, unix_now,
+};
 use happyview::plugin::ScriptKind;
 
 const QUERY: &str = "games.gamesgamesgamesgames.listGames";
@@ -146,10 +148,15 @@ fn run_at(metrics: &ScriptMetrics, at: u64, wall_ms: u64) {
 }
 
 fn record_at(metrics: &ScriptMetrics, at: u64) {
+    record_from(metrics, at, RecordOrigin::Live);
+}
+
+fn record_from(metrics: &ScriptMetrics, at: u64, origin: RecordOrigin) {
     metrics.record_ingest_at(
         at * 1_000,
         "games.gamesgamesgamesgames.game",
         "create",
+        origin,
         None,
         &RecordSample {
             decision: RecordDecision::Proceed,
@@ -385,4 +392,64 @@ async fn stored_windows_sum_every_instance_sharing_the_database() {
     assert_eq!(rows(&app, "minute").await, 0);
     assert_eq!(rows(&app, "hour").await, 4);
     check("after both folds").await;
+}
+
+/// The records ingest was handed, by origin and UTC day or hour: stored
+/// minutes and those still in memory, for the platform's usage meter.
+#[tokio::test]
+async fn delivered_records_are_read_by_origin_and_step() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let metrics = &app.state.metrics;
+    let (db, backend) = (&app.state.db, app.state.db_backend);
+    let base = unix_now();
+    let three_days_ago = base - 3 * DAY;
+    record_from(metrics, three_days_ago, RecordOrigin::Live);
+    record_from(metrics, three_days_ago + 1, RecordOrigin::Backfill);
+    persist::write_closed(metrics, db, backend, three_days_ago + 60)
+        .await
+        .unwrap();
+    // Still in memory.
+    record_from(metrics, base, RecordOrigin::StorePass);
+
+    let rfc = |secs: u64| {
+        chrono::DateTime::from_timestamp(secs as i64, 0)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let from = rfc(base - 7 * DAY);
+    let (status, days) = get(&app, &format!("/admin/metrics/delivered?from={from}")).await;
+    assert_eq!(status, StatusCode::OK, "{days}");
+    assert_eq!(days["step"], "1d");
+    assert_eq!(days["enabled"], true);
+    let points = days["points"].as_array().unwrap();
+    assert_eq!(points.len(), 2, "{days:#}");
+    assert_eq!(points[0]["records"], 2);
+    assert_eq!(points[0]["origins"], json!({"live": 1, "backfill": 1}));
+    assert_eq!(points[1]["origins"], json!({"store_pass": 1}));
+
+    let hour = base - base % 3_600;
+    let (status, hours) = get(
+        &app,
+        &format!(
+            "/admin/metrics/delivered?from={}&to={}&step=1h",
+            rfc(hour),
+            rfc(hour + 3_600)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{hours}");
+    assert_eq!(hours["points"].as_array().unwrap().len(), 1, "{hours:#}");
+    assert_eq!(hours["points"][0]["records"], 1);
+
+    for uri in [
+        "/admin/metrics/delivered".to_string(),
+        "/admin/metrics/delivered?from=yesterday".to_string(),
+        format!("/admin/metrics/delivered?from={from}&step=1m"),
+        format!("/admin/metrics/delivered?from={}&to={from}", rfc(base)),
+        format!("/admin/metrics/delivered?from={}", rfc(base - 40 * DAY)),
+    ] {
+        let (status, body) = get(&app, &uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
 }

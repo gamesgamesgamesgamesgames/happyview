@@ -32,7 +32,7 @@ use sqlx::AnyPool;
 use crate::db::{DatabaseBackend, adapt_sql};
 use crate::plugin::ScriptKind;
 
-use super::ingest::{DECISIONS, IngestBucket, IngestSummary};
+use super::ingest::{DECISIONS, IngestBucket, IngestSummary, ORIGINS, RecordOrigin};
 use super::sketch::Sketch;
 use super::window::{
     Accumulate, Bucket, HALF_HOUR_SECS, HALF_HOURS_KEPT, History, HostImportSum, MINUTE_SECS,
@@ -117,17 +117,27 @@ impl RowKey for Key {
     }
 }
 
+/// An ingest row's `variant` is `<action>/<origin>`. A row written before
+/// origins were kept has the action alone, and reads as of unknown origin.
 impl RowKey for IngestKey {
     const KIND: &'static str = "ingest";
 
     fn encode(&self) -> (String, String) {
-        (self.collection.clone(), self.action.to_string())
+        (
+            self.collection.clone(),
+            format!("{}/{}", self.action, self.origin.as_str()),
+        )
     }
 
     fn decode(key: &str, variant: &str) -> Option<Self> {
+        let (action, origin) = match variant.split_once('/') {
+            Some((action, origin)) => (action, RecordOrigin::parse(origin)),
+            None => (variant, RecordOrigin::Unknown),
+        };
         Some(Self {
             collection: key.to_string(),
-            action: intern(variant),
+            action: intern(action),
+            origin,
         })
     }
 }
@@ -1117,10 +1127,11 @@ pub async fn ingest(
         now,
     )
     .await?;
-    let mut merged: HashMap<IngestKey, (IngestBucket, u64)> = HashMap::new();
+    // Every origin's records together, as the in-memory windows give them.
+    let mut merged: HashMap<(String, &'static str), (IngestBucket, u64)> = HashMap::new();
     for (key, start, bucket) in buckets {
         let (held, oldest) = merged
-            .entry(key)
+            .entry((key.collection, key.action))
             .or_insert_with(|| (IngestBucket::default(), start));
         held.merge_from(&bucket);
         *oldest = (*oldest).min(start);
@@ -1128,12 +1139,70 @@ pub async fn ingest(
     let mut out: Vec<IngestSummary> = merged
         .into_iter()
         .filter(|(_, (bucket, _))| bucket.records > 0)
-        .map(|(key, (bucket, oldest))| {
-            bucket.summary(&key.collection, key.action, now.saturating_sub(oldest) + 1)
+        .map(|((collection, action), (bucket, oldest))| {
+            bucket.summary(&collection, action, now.saturating_sub(oldest) + 1)
         })
         .collect();
     sort_ingest(&mut out);
     Ok(out)
+}
+
+/// The records ingest was handed in one step, by origin.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct DeliveredPoint {
+    /// RFC 3339, UTC.
+    pub start: String,
+    pub records: u64,
+    /// Every origin that saw records in the step.
+    pub origins: BTreeMap<&'static str, u64>,
+}
+
+/// The records ingest was handed from `from` up to `to`, every instance's,
+/// as read at `now`: one point per `width`-second step starting at `from`
+/// (UTC hours or days). Steps with none are left out. `from` and `to` are
+/// aligned down to `width`, and rows the table folded to the hour are counted
+/// whole in their hour.
+pub async fn delivered(
+    metrics: &ScriptMetrics,
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+    now: u64,
+    from: u64,
+    to: u64,
+    width: u64,
+) -> Result<Vec<DeliveredPoint>, sqlx::Error> {
+    let (from, to) = (align(from, width), align(to, width));
+    // Memory's minutes are read as of `now`, wherever the range ends.
+    let buckets = collect::<IngestKey, IngestBucket>(
+        metrics.ingest_entries(),
+        metrics.persisted_to(),
+        pool,
+        backend,
+        None,
+        from,
+        now.min(to.saturating_sub(1)),
+    )
+    .await?;
+    let mut steps: BTreeMap<u64, [u64; ORIGINS.len()]> = BTreeMap::new();
+    for (key, start, bucket) in buckets {
+        if start < from || start >= to || bucket.records == 0 {
+            continue;
+        }
+        steps.entry(align(start, width)).or_default()[key.origin.index()] += bucket.records;
+    }
+    Ok(steps
+        .into_iter()
+        .map(|(start, counts)| DeliveredPoint {
+            start: rfc3339(start),
+            records: counts.iter().sum(),
+            origins: ORIGINS
+                .iter()
+                .zip(counts)
+                .filter(|(_, n)| *n > 0)
+                .map(|(name, n)| (*name, n))
+                .collect(),
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -1260,9 +1329,119 @@ mod tests {
         let ingest = IngestKey {
             collection: "a.b.c".into(),
             action: "create",
+            origin: RecordOrigin::StorePass,
         };
         let (k, v) = ingest.encode();
+        assert_eq!(v, "create/store_pass");
         assert_eq!(IngestKey::decode(&k, &v), Some(ingest));
+    }
+
+    #[test]
+    fn an_ingest_row_written_before_origins_reads_as_unknown() {
+        let old = IngestKey::decode("a.b.c", "create").unwrap();
+        assert_eq!((old.action, old.origin), ("create", RecordOrigin::Unknown));
+        let newer = IngestKey::decode("a.b.c", "delete/somewhere").unwrap();
+        assert_eq!(
+            (newer.action, newer.origin),
+            ("delete", RecordOrigin::Unknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn delivered_counts_each_origin_per_step_from_the_table_and_memory() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let m = ScriptMetrics::new();
+        let at = |secs: u64| secs * 1_000;
+        for (secs, origin) in [
+            (T0 + 10, RecordOrigin::Live),
+            (T0 + 20, RecordOrigin::Live),
+            (T0 + 30, RecordOrigin::Backfill),
+        ] {
+            m.record_ingest_at(at(secs), "a.b.c", "create", origin, None, &record(4));
+        }
+        m.record_ingest_at(
+            at(T0 + 40),
+            "d.e.f",
+            "delete",
+            RecordOrigin::Live,
+            None,
+            &record(4),
+        );
+        // The first hour's minutes go to the table; the second hour's stay in
+        // memory.
+        write_closed(&m, &pool, SQLITE, T0 + 600).await.unwrap();
+        for (secs, origin) in [
+            (T0 + 3_600 + 5, RecordOrigin::StorePass),
+            (T0 + 3_600 + 70, RecordOrigin::Retry),
+        ] {
+            m.record_ingest_at(at(secs), "a.b.c", "create", origin, None, &record(4));
+        }
+        // A row from before origins, from another instance.
+        crate::db::query(&upsert_sql(SQLITE))
+            .bind("ingest")
+            .bind("a.b.c")
+            .bind("create")
+            .bind(MINUTE)
+            .bind(rfc3339(T0 + 120))
+            .bind(r#"{"records":7}"#)
+            .bind("{}")
+            .bind("older")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let hours = delivered(&m, &pool, SQLITE, T0 + 3_700, T0, T0 + 2 * 3_600, 3_600)
+            .await
+            .unwrap();
+        assert_eq!(
+            hours,
+            vec![
+                DeliveredPoint {
+                    start: rfc3339(T0),
+                    records: 11,
+                    origins: BTreeMap::from([("backfill", 1), ("live", 3), ("unknown", 7)]),
+                },
+                DeliveredPoint {
+                    start: rfc3339(T0 + 3_600),
+                    records: 2,
+                    origins: BTreeMap::from([("retry", 1), ("store_pass", 1)]),
+                },
+            ]
+        );
+        // `to` is exclusive.
+        let first = delivered(&m, &pool, SQLITE, T0 + 3_700, T0, T0 + 3_600, 3_600)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let days = delivered(&m, &pool, SQLITE, T0 + 3_700, T0 + 600, T0 + 86_400, 86_400)
+            .await
+            .unwrap();
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].start, rfc3339(T0));
+        assert_eq!(days[0].records, 13);
+    }
+
+    #[tokio::test]
+    async fn the_ingest_window_adds_every_origin_together() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let m = ScriptMetrics::new();
+        let now = super::super::unix_now();
+        for origin in [RecordOrigin::Live, RecordOrigin::Backfill] {
+            m.record_ingest_at(
+                (now - 5) * 1_000,
+                "a.b.c",
+                "create",
+                origin,
+                None,
+                &record(4),
+            );
+        }
+        let memory = m.ingest_at(now, Window::Hour);
+        assert_eq!(memory.len(), 1);
+        assert_eq!(memory[0].records, 2);
+        let stored = ingest(&m, &pool, SQLITE, now, Window::Week).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].records, 2);
     }
 
     #[tokio::test]
@@ -1270,7 +1449,14 @@ mod tests {
         let pool = crate::test_support::migrated_memory_pool().await;
         let m = ScriptMetrics::new();
         run(&m, T0 + 5, 10);
-        m.record_ingest_at((T0 + 6) * 1_000, "a.b.c", "create", None, &record(4));
+        m.record_ingest_at(
+            (T0 + 6) * 1_000,
+            "a.b.c",
+            "create",
+            RecordOrigin::Live,
+            None,
+            &record(4),
+        );
         // Still open: nothing to write.
         assert_eq!(write_closed(&m, &pool, SQLITE, T0 + 30).await.unwrap(), 0);
         assert_eq!(count(&pool, MINUTE).await, 0);
@@ -1387,7 +1573,14 @@ mod tests {
         run(&before, now - 20 * 3_600, 10);
         run(&before, now - 600, 20);
         run(&before, now - 590, 20);
-        before.record_ingest_at((now - 300) * 1_000, "a.b.c", "create", None, &record(4));
+        before.record_ingest_at(
+            (now - 300) * 1_000,
+            "a.b.c",
+            "create",
+            RecordOrigin::Live,
+            None,
+            &record(4),
+        );
         // The first row has left memory's minute ring, so it is written by
         // an earlier tick, as it would have been.
         write_closed(&before, &pool, SQLITE, now - 20 * 3_600 + 60)
@@ -1459,7 +1652,14 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        m.record_ingest_at((now - 5) * 1_000, "a.b.c", "create", None, &record(4));
+        m.record_ingest_at(
+            (now - 5) * 1_000,
+            "a.b.c",
+            "create",
+            RecordOrigin::Live,
+            None,
+            &record(4),
+        );
         let rows = ingest(&m, &pool, SQLITE, now, Window::Month).await.unwrap();
         assert_eq!(rows[0].records, 1);
     }
@@ -1590,7 +1790,14 @@ mod tests {
         run(&a, now - 600, 10);
         run(&b, now - 600, 20);
         run(&b, now - 300, 20);
-        b.record_ingest_at((now - 300) * 1_000, "a.b.c", "create", None, &record(4));
+        b.record_ingest_at(
+            (now - 300) * 1_000,
+            "a.b.c",
+            "create",
+            RecordOrigin::Live,
+            None,
+            &record(4),
+        );
         write_closed(&a, &pool, SQLITE, now).await.unwrap();
         write_closed(&b, &pool, SQLITE, now).await.unwrap();
 
