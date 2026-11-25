@@ -395,22 +395,25 @@ async fn stored_windows_sum_every_instance_sharing_the_database() {
 }
 
 /// The records ingest was handed, by origin and UTC day or hour: stored
-/// minutes and those still in memory, for the platform's usage meter.
+/// minutes and those still in memory, counted whether or not script metrics
+/// are on.
 #[tokio::test]
 async fn delivered_records_are_read_by_origin_and_step() {
     common::require_db!();
     let app = TestApp::new().await;
     let metrics = &app.state.metrics;
     let (db, backend) = (&app.state.db, app.state.db_backend);
+    metrics.set_enabled(false);
     let base = unix_now();
+    let delivered = metrics.delivered();
     let three_days_ago = base - 3 * DAY;
-    record_from(metrics, three_days_ago, RecordOrigin::Live);
-    record_from(metrics, three_days_ago + 1, RecordOrigin::Backfill);
-    persist::write_closed(metrics, db, backend, three_days_ago + 60)
-        .await
-        .unwrap();
+    delivered.count_at(three_days_ago, RecordOrigin::Live);
+    delivered.count_at(three_days_ago + 1, RecordOrigin::Backfill);
+    Persister::default()
+        .tick(metrics, db, backend, three_days_ago + 120)
+        .await;
     // Still in memory.
-    record_from(metrics, base, RecordOrigin::StorePass);
+    delivered.count_at(base, RecordOrigin::StorePass);
 
     let rfc = |secs: u64| {
         chrono::DateTime::from_timestamp(secs as i64, 0)
@@ -421,7 +424,7 @@ async fn delivered_records_are_read_by_origin_and_step() {
     let (status, days) = get(&app, &format!("/admin/metrics/delivered?from={from}")).await;
     assert_eq!(status, StatusCode::OK, "{days}");
     assert_eq!(days["step"], "1d");
-    assert_eq!(days["enabled"], true);
+    assert_eq!(days["overflow"], 0);
     let points = days["points"].as_array().unwrap();
     assert_eq!(points.len(), 2, "{days:#}");
     assert_eq!(points[0]["records"], 2);

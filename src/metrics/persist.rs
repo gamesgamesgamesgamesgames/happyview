@@ -32,7 +32,7 @@ use sqlx::AnyPool;
 use crate::db::{DatabaseBackend, adapt_sql};
 use crate::plugin::ScriptKind;
 
-use super::ingest::{DECISIONS, IngestBucket, IngestSummary, ORIGINS, RecordOrigin};
+use super::ingest::{DECISIONS, IngestBucket, IngestSummary, RecordOrigin};
 use super::sketch::Sketch;
 use super::window::{
     Accumulate, Bucket, HALF_HOUR_SECS, HALF_HOURS_KEPT, History, HostImportSum, MINUTE_SECS,
@@ -435,7 +435,7 @@ fn closed_rows<K: RowKey, B: Stored>(
     }
 }
 
-fn upsert_sql(backend: DatabaseBackend) -> String {
+pub(crate) fn upsert_sql(backend: DatabaseBackend) -> String {
     adapt_sql(
         "INSERT INTO happyview_script_metrics \
          (kind, key, variant, resolution, bucket_start, counters, sketches, instance) \
@@ -634,6 +634,9 @@ pub async fn fold(
             let encoded = match kind.as_str() {
                 k if k == Key::KIND => merge_rows::<Bucket>(&rows).encode(),
                 k if k == IngestKey::KIND => merge_rows::<IngestBucket>(&rows).encode(),
+                k if k == super::delivered::KIND => {
+                    (super::delivered::merge(&rows), "{}".to_string())
+                }
                 other => {
                     tracing::warn!(
                         kind = other,
@@ -721,6 +724,15 @@ impl Persister {
         match write_closed(metrics, pool, backend, now).await {
             Ok(n) => outcome.written = n,
             Err(e) => tracing::warn!(error = %e, "failed to write script metrics"),
+        }
+        // Whether or not script metrics are on.
+        match metrics
+            .delivered()
+            .write_closed(pool, backend, metrics.instance(), now)
+            .await
+        {
+            Ok(n) => outcome.written += n,
+            Err(e) => tracing::warn!(error = %e, "failed to write records delivered"),
         }
         if self
             .maintained_at
@@ -850,6 +862,7 @@ pub async fn reload(
         restored += u64::from(done);
     }
     metrics.persisted_to.fetch_max(open, Ordering::Relaxed);
+    metrics.delivered().mark_persisted(open);
     Ok(restored)
 }
 
@@ -1147,64 +1160,6 @@ pub async fn ingest(
     Ok(out)
 }
 
-/// The records ingest was handed in one step, by origin.
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct DeliveredPoint {
-    /// RFC 3339, UTC.
-    pub start: String,
-    pub records: u64,
-    /// Every origin that saw records in the step.
-    pub origins: BTreeMap<&'static str, u64>,
-}
-
-/// The records ingest was handed from `from` up to `to`, every instance's,
-/// as read at `now`: one point per `width`-second step starting at `from`
-/// (UTC hours or days). Steps with none are left out. `from` and `to` are
-/// aligned down to `width`, and rows the table folded to the hour are counted
-/// whole in their hour.
-pub async fn delivered(
-    metrics: &ScriptMetrics,
-    pool: &AnyPool,
-    backend: DatabaseBackend,
-    now: u64,
-    from: u64,
-    to: u64,
-    width: u64,
-) -> Result<Vec<DeliveredPoint>, sqlx::Error> {
-    let (from, to) = (align(from, width), align(to, width));
-    // Memory's minutes are read as of `now`, wherever the range ends.
-    let buckets = collect::<IngestKey, IngestBucket>(
-        metrics.ingest_entries(),
-        metrics.persisted_to(),
-        pool,
-        backend,
-        None,
-        from,
-        now.min(to.saturating_sub(1)),
-    )
-    .await?;
-    let mut steps: BTreeMap<u64, [u64; ORIGINS.len()]> = BTreeMap::new();
-    for (key, start, bucket) in buckets {
-        if start < from || start >= to || bucket.records == 0 {
-            continue;
-        }
-        steps.entry(align(start, width)).or_default()[key.origin.index()] += bucket.records;
-    }
-    Ok(steps
-        .into_iter()
-        .map(|(start, counts)| DeliveredPoint {
-            start: rfc3339(start),
-            records: counts.iter().sum(),
-            origins: ORIGINS
-                .iter()
-                .zip(counts)
-                .filter(|(_, n)| *n > 0)
-                .map(|(name, n)| (*name, n))
-                .collect(),
-        })
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::ingest::{RecordDecision, RecordSample};
@@ -1345,80 +1300,6 @@ mod tests {
             (newer.action, newer.origin),
             ("delete", RecordOrigin::Unknown)
         );
-    }
-
-    #[tokio::test]
-    async fn delivered_counts_each_origin_per_step_from_the_table_and_memory() {
-        let pool = crate::test_support::migrated_memory_pool().await;
-        let m = ScriptMetrics::new();
-        let at = |secs: u64| secs * 1_000;
-        for (secs, origin) in [
-            (T0 + 10, RecordOrigin::Live),
-            (T0 + 20, RecordOrigin::Live),
-            (T0 + 30, RecordOrigin::Backfill),
-        ] {
-            m.record_ingest_at(at(secs), "a.b.c", "create", origin, None, &record(4));
-        }
-        m.record_ingest_at(
-            at(T0 + 40),
-            "d.e.f",
-            "delete",
-            RecordOrigin::Live,
-            None,
-            &record(4),
-        );
-        // The first hour's minutes go to the table; the second hour's stay in
-        // memory.
-        write_closed(&m, &pool, SQLITE, T0 + 600).await.unwrap();
-        for (secs, origin) in [
-            (T0 + 3_600 + 5, RecordOrigin::StorePass),
-            (T0 + 3_600 + 70, RecordOrigin::Retry),
-        ] {
-            m.record_ingest_at(at(secs), "a.b.c", "create", origin, None, &record(4));
-        }
-        // A row from before origins, from another instance.
-        crate::db::query(&upsert_sql(SQLITE))
-            .bind("ingest")
-            .bind("a.b.c")
-            .bind("create")
-            .bind(MINUTE)
-            .bind(rfc3339(T0 + 120))
-            .bind(r#"{"records":7}"#)
-            .bind("{}")
-            .bind("older")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let hours = delivered(&m, &pool, SQLITE, T0 + 3_700, T0, T0 + 2 * 3_600, 3_600)
-            .await
-            .unwrap();
-        assert_eq!(
-            hours,
-            vec![
-                DeliveredPoint {
-                    start: rfc3339(T0),
-                    records: 11,
-                    origins: BTreeMap::from([("backfill", 1), ("live", 3), ("unknown", 7)]),
-                },
-                DeliveredPoint {
-                    start: rfc3339(T0 + 3_600),
-                    records: 2,
-                    origins: BTreeMap::from([("retry", 1), ("store_pass", 1)]),
-                },
-            ]
-        );
-        // `to` is exclusive.
-        let first = delivered(&m, &pool, SQLITE, T0 + 3_700, T0, T0 + 3_600, 3_600)
-            .await
-            .unwrap();
-        assert_eq!(first.len(), 1);
-        let days = delivered(&m, &pool, SQLITE, T0 + 3_700, T0 + 600, T0 + 86_400, 86_400)
-            .await
-            .unwrap();
-        assert_eq!(days.len(), 1);
-        assert_eq!(days[0].start, rfc3339(T0));
-        assert_eq!(days[0].records, 13);
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@
 //! [`persist`] writes the minutes that have closed, and a restart reads the
 //! last day back.
 
+pub mod delivered;
 pub mod ingest;
 pub mod instance;
 pub mod job;
@@ -291,6 +292,8 @@ pub struct ScriptMetrics {
     persisted_to: AtomicU64,
     /// This process's id in the table's `instance` column; see [`instance`].
     instance: String,
+    /// Records delivered, counted whether or not the rest is on.
+    delivered: delivered::Delivered,
 }
 
 impl Default for ScriptMetrics {
@@ -304,6 +307,7 @@ impl Default for ScriptMetrics {
             active: Default::default(),
             persisted_to: AtomicU64::new(0),
             instance: instance::this_process().to_string(),
+            delivered: delivered::Delivered::default(),
         }
     }
 }
@@ -386,6 +390,11 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// `secs` since the epoch as RFC 3339, UTC.
+pub fn rfc3339_of(secs: u64) -> String {
+    rfc3339(secs)
+}
+
 fn rfc3339(secs: u64) -> String {
     chrono::DateTime::from_timestamp(i64::try_from(secs).unwrap_or(i64::MAX), 0)
         .unwrap_or_default()
@@ -410,6 +419,17 @@ impl ScriptMetrics {
     /// This process's id in the stored rows.
     pub fn instance(&self) -> &str {
         &self.instance
+    }
+
+    /// Records delivered, by origin.
+    pub fn delivered(&self) -> &delivered::Delivered {
+        &self.delivered
+    }
+
+    /// One record from `origin` handed to ingest now. Counted whether or
+    /// not script metrics are on.
+    pub fn count_delivered(&self, origin: RecordOrigin) {
+        self.delivered.count_at(unix_now(), origin);
     }
 
     pub fn enabled(&self) -> bool {

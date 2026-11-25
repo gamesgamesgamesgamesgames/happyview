@@ -209,8 +209,9 @@ fn time_of(raw: &str, name: &str) -> Result<u64, AppError> {
 
 /// GET /admin/metrics/delivered — the records ingest was handed, by origin,
 /// per UTC hour or day (`step=1h` or `step=1d`, the default) from `from` up
-/// to `to` (default now). Both are aligned down to the step. `enabled` is
-/// false while script metrics are off, when nothing is counted.
+/// to `to` (default the end of the open step). Both are aligned down to the
+/// step, and the range is checked after. Counted independently of the
+/// script-metrics setting.
 pub(super) async fn delivered(
     State(state): State<AppState>,
     AllowPlatform(auth): AllowPlatform,
@@ -229,14 +230,19 @@ pub(super) async fn delivered(
         },
     };
     let now = unix_now();
+    let width = step.secs();
     let Some(from) = query.from.as_deref() else {
         return Err(AppError::BadRequest("from is required".into()));
     };
     let from = time_of(from, "from")?;
+    let from = from - from % width;
     let to = match query.to.as_deref() {
         // Up to the end of the step still open.
-        None => now - now % step.secs() + step.secs(),
-        Some(raw) => time_of(raw, "to")?,
+        None => now - now % width + width,
+        Some(raw) => {
+            let to = time_of(raw, "to")?;
+            to - to % width
+        }
     };
     if to < from {
         return Err(AppError::BadRequest("to is before from".into()));
@@ -246,21 +252,20 @@ pub(super) async fn delivered(
             "the range may be at most {MAX_DELIVERED_DAYS} days"
         )));
     }
-    let points = persist::delivered(
-        &state.metrics,
-        &state.db,
-        state.db_backend,
-        now,
-        from,
-        to,
-        step.secs(),
-    )
-    .await
-    .map_err(read_failed)?;
+    let points = state
+        .metrics
+        .delivered()
+        .read(&state.db, state.db_backend, now, from, to, width)
+        .await
+        .map_err(read_failed)?;
     let mut body = json!({
         "step": step.as_str(),
-        "enabled": state.metrics.enabled(),
+        "from": crate::metrics::rfc3339_of(from),
+        "to": crate::metrics::rfc3339_of(to),
         "points": points,
+        // Ingest records the per-collection metrics dropped. Records
+        // delivered are counted apart and never dropped.
+        "overflow": state.metrics.overflow(),
     });
     stored_fields(&state, Window::Month, None, &mut body).await;
     Ok(Json(body))

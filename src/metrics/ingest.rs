@@ -194,8 +194,9 @@ pub fn note_dead_lettered() {
     });
 }
 
-/// One record being measured, or nothing while metrics are off.
-pub struct RecordTimer(Option<Box<Timing>>);
+/// One record being measured, or nothing while metrics are off. Either way
+/// its delivery is counted once, when it finishes.
+pub struct RecordTimer(Option<Box<Timing>>, Option<RecordOrigin>);
 
 struct Timing {
     collection: String,
@@ -212,28 +213,32 @@ struct Timing {
 
 impl RecordTimer {
     pub fn start(metrics: &ScriptMetrics, ev: &RecordEvent) -> Self {
+        let origin = RecordOrigin::of(ev);
         if !metrics.enabled() {
-            return Self(None);
+            return Self(None, Some(origin));
         }
-        Self(Some(Box::new(Timing {
-            collection: ev.key.collection.clone(),
-            action: ev.action.as_str(),
-            origin: RecordOrigin::of(ev),
-            job: match &ev.origin {
-                Origin::Backfill { job_id } => Some(job_id.clone()),
-                Origin::Live | Origin::Retry => None,
-            },
-            started: Instant::now(),
-            collector: Arc::default(),
-            stages: Vec::new(),
-            decision: RecordDecision::Proceed,
-            hooked: None,
-        })))
+        Self(
+            Some(Box::new(Timing {
+                collection: ev.key.collection.clone(),
+                action: ev.action.as_str(),
+                origin,
+                job: match &ev.origin {
+                    Origin::Backfill { job_id } => Some(job_id.clone()),
+                    Origin::Live | Origin::Retry => None,
+                },
+                started: Instant::now(),
+                collector: Arc::default(),
+                stages: Vec::new(),
+                decision: RecordDecision::Proceed,
+                hooked: None,
+            })),
+            Some(origin),
+        )
     }
 
-    /// A timer that measures nothing.
+    /// A timer that measures and counts nothing.
     pub fn off() -> Self {
-        Self(None)
+        Self(None, None)
     }
 
     /// Run the record's hook, `fut`: its lookup is `resolve`, the rest is
@@ -284,6 +289,9 @@ impl RecordTimer {
     /// The record is done, with `write` the stage and time of its write when
     /// it had one.
     pub fn finish(self, metrics: &ScriptMetrics, write: Option<(&'static str, Duration)>) {
+        if let Some(origin) = self.1 {
+            metrics.count_delivered(origin);
+        }
         let Some(timing) = self.0 else {
             return;
         };
@@ -561,6 +569,35 @@ mod tests {
         timer.hooking(async { note_dead_lettered() }).await;
         timer.finish(&metrics, None);
         assert!(metrics.ingest(super::super::Window::Hour).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_delivery_is_counted_once_whether_or_not_metrics_are_on() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let metrics = ScriptMetrics::new();
+        metrics.set_enabled(false);
+        RecordTimer::start(&metrics, &event(Origin::Live)).finish(&metrics, None);
+        metrics.set_enabled(true);
+        RecordTimer::start(&metrics, &event(Origin::Retry)).finish(&metrics, None);
+        // A timer that measures nothing counts nothing.
+        RecordTimer::off().finish(&metrics, None);
+        let now = super::super::unix_now();
+        let points = metrics
+            .delivered()
+            .read(
+                &pool,
+                crate::db::DatabaseBackend::Sqlite,
+                now,
+                now - 3_600,
+                now + 3_600,
+                3_600,
+            )
+            .await
+            .unwrap();
+        let total: u64 = points.iter().map(|p| p.records).sum();
+        assert_eq!(total, 2);
+        let live: u64 = points.iter().filter_map(|p| p.origins.get("live")).sum();
+        assert_eq!(live, 1);
     }
 
     #[tokio::test]
