@@ -345,10 +345,11 @@ mod tests {
     #[tokio::test]
     async fn xrpc_request_under_a_configured_base_path_still_increments_xrpc_requests() {
         let counters = Arc::new(Counters::new());
+        let metrics = Arc::new(crate::metrics::ScriptMetrics::new());
         let telemetry_state = TelemetryState {
             counters: counters.clone(),
             base_path: Some("/happyview".to_string()),
-            metrics: None,
+            metrics: Some(metrics.clone()),
         };
         let app = Router::new()
             .route("/happyview/xrpc/com.example.probe", get(|| async { "ok" }))
@@ -369,6 +370,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(counters.xrpc_requests.load(Ordering::Relaxed), 1);
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let now = crate::metrics::unix_now();
+        let points = metrics
+            .xrpc()
+            .read(
+                &pool,
+                crate::db::DatabaseBackend::Sqlite,
+                now,
+                now - 3_600,
+                now + 3_600,
+                3_600,
+            )
+            .await
+            .unwrap();
+        assert_eq!(points.iter().map(|p| p.requests).sum::<u64>(), 1);
     }
 
     #[test]

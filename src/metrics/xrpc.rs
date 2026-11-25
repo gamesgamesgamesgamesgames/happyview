@@ -1,6 +1,7 @@
-//! XRPC requests: how many requests the instance's `/xrpc/` routes were
-//! sent, by method kind, per minute, counted independently of any instance
-//! setting. See [`super::counter`] for how they're kept.
+//! XRPC requests: how many requests were sent to paths under `/xrpc/`, by
+//! method kind, per minute, counted independently of any instance setting.
+//! Every such request counts, routed or not, whatever it answers. See
+//! [`super::counter`] for how they're kept.
 
 use std::collections::BTreeMap;
 

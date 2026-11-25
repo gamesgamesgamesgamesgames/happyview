@@ -194,6 +194,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(points[0].records, 10);
+        // The XRPC counter's rows fold the same way.
+        let x = super::super::xrpc::XrpcRequests::default();
+        x.count_at(T0, &axum::http::Method::POST);
+        x.count_at(T0 + 61, &axum::http::Method::POST);
+        x.write_closed(&pool, SQLITE, "a", T0 + 600).await.unwrap();
+        assert_eq!(
+            super::super::persist::fold(&pool, SQLITE, now, "a")
+                .await
+                .unwrap(),
+            2
+        );
+        let xs = x
+            .read(&pool, SQLITE, now, T0, T0 + 86_400, 86_400)
+            .await
+            .unwrap();
+        assert_eq!(xs[0].methods.get("procedure"), Some(&2));
     }
 
     #[tokio::test]
@@ -215,8 +231,11 @@ mod tests {
         let sweep = |days_later: u64, keep: u32| {
             super::super::persist::sweep(&pool, SQLITE, T0 + days_later * 86_400, keep)
         };
+        let x = super::super::xrpc::XrpcRequests::default();
+        x.count_at(T0, &axum::http::Method::GET);
+        x.write_closed(&pool, SQLITE, "a", T0 + 60).await.unwrap();
         assert_eq!(sweep(10, 1).await.unwrap(), 0);
-        assert_eq!(sweep(36, 1).await.unwrap(), 1);
+        assert_eq!(sweep(36, 1).await.unwrap(), 2, "both counters' rows");
     }
 
     #[test]

@@ -278,9 +278,11 @@ fn counter_range(query: &DeliveredQuery) -> Result<(Step, u64, u64, u64), AppErr
     Ok((step, now, from, to))
 }
 
-/// GET /admin/metrics/xrpc — the requests the instance's XRPC routes were
-/// sent, by method kind, per UTC hour or day, with the same parameters as
-/// [`delivered`]. Counted independently of any instance setting.
+/// GET /admin/metrics/xrpc — the requests sent to paths under `/xrpc/`, by
+/// method kind, per UTC hour or day, with the same parameters as
+/// [`delivered`]. Every such request counts, whether or not it names a
+/// method the instance serves and whatever it answers; a CORS preflight
+/// counts as `other`. Counted independently of any instance setting.
 pub(super) async fn xrpc(
     State(state): State<AppState>,
     AllowPlatform(auth): AllowPlatform,
