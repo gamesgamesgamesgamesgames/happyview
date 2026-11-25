@@ -253,7 +253,11 @@ struct GetSpaceCredentialInput {
 #[serde(rename_all = "camelCase")]
 struct CreateRecordInput {
     space: String,
+    /// The lexicons' repo, which must be the caller's.
+    repo: Option<String>,
     collection: String,
+    /// A key the caller chose; a TID when omitted.
+    rkey: Option<String>,
     record: serde_json::Value,
 }
 
@@ -278,8 +282,166 @@ struct ClearRecordsInput {
 #[serde(rename_all = "camelCase")]
 struct ApplyWritesInput {
     space: String,
+    /// The lexicons' repo, which must be the caller's. Optional, as HappyView's
+    /// earlier routes took none.
+    repo: Option<String>,
+    swap_commit: Option<String>,
+    /// Read by [`parse_writes`]: each tagged by `action` (HappyView's earlier
+    /// shape) or by the lexicons' `$type` union.
+    writes: Vec<serde_json::Value>,
+}
+
+/// `applyWrites`'s body in HappyView's earlier shape, read as it always was.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActionApplyWritesInput {
+    space: String,
     swap_commit: Option<String>,
     writes: Vec<WriteOp>,
+}
+
+/// An `applyWrites` batch, read in the shape its writes are tagged in.
+struct ApplyWritesBatch {
+    space: String,
+    repo: Option<String>,
+    swap_commit: Option<String>,
+    writes: Vec<WriteOp>,
+    shape: WritesShape,
+}
+
+/// Whether a write is tagged by the lexicons' `$type` union. A write with an
+/// `action` is HappyView's earlier shape, whatever its `$type` says, as it
+/// always was.
+fn is_lexicon_write(write: &serde_json::Value) -> bool {
+    write.get("action").is_none()
+        && write
+            .get("$type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.starts_with(LEXICON_WRITE_PREFIX))
+}
+
+/// Read an `applyWrites` body. A batch none of whose writes names a lexicon
+/// write type is HappyView's earlier shape, and is read exactly as before:
+/// through axum's JSON extractor, so its refusals are the ones it always gave.
+/// Otherwise every write must be the lexicons'. The `Ok(Err(_))` case is the
+/// earlier shape's own refusal, answered as it is.
+fn read_apply_writes(
+    body: serde_json::Value,
+) -> Result<Result<ApplyWritesBatch, Response>, AppError> {
+    let invalid = |message: String| bad_request("InvalidRequest", message);
+    let writes = body.get("writes").and_then(|w| w.as_array());
+    if writes.is_some_and(|w| w.len() > MAX_WRITES) {
+        return Err(invalid(format!("too many writes: at most {MAX_WRITES}")));
+    }
+    if !writes.is_some_and(|w| w.iter().any(is_lexicon_write)) {
+        let bytes = serde_json::to_vec(&body)
+            .map_err(|e| AppError::Internal(format!("failed to re-encode a body: {e}")))?;
+        return Ok(match Json::<ActionApplyWritesInput>::from_bytes(&bytes) {
+            Ok(Json(input)) => Ok(ApplyWritesBatch {
+                space: input.space,
+                repo: None,
+                swap_commit: input.swap_commit,
+                writes: input.writes,
+                shape: WritesShape::Action,
+            }),
+            Err(rejection) => Err(rejection.into_response()),
+        });
+    }
+    let input: ApplyWritesInput =
+        serde_json::from_value(body).map_err(|e| invalid(format!("invalid applyWrites: {e}")))?;
+    Ok(Ok(ApplyWritesBatch {
+        space: input.space,
+        repo: input.repo,
+        swap_commit: input.swap_commit,
+        writes: parse_writes(input.writes)?,
+        shape: WritesShape::Lexicon,
+    }))
+}
+
+/// How an `applyWrites` request tags its writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WritesShape {
+    /// `action: create | update | delete`, HappyView's earlier shape. An update
+    /// of a missing record creates it, and deleting one is a 404.
+    Action,
+    /// The lexicons' `$type` union (`com.atproto.space.applyWrites#create`,
+    /// …). Updating or deleting a missing record is `RecordNotFound`, as the
+    /// lexicons have it.
+    Lexicon,
+}
+
+const LEXICON_WRITE_PREFIX: &str = "com.atproto.space.applyWrites#";
+
+/// The most writes one `applyWrites` takes, in either shape, as the reference.
+const MAX_WRITES: usize = 200;
+
+/// Read a lexicon-shaped batch's writes: each tagged by `$type` as one of
+/// `com.atproto.space.applyWrites`'s write types. The lexicons' writes take
+/// no `swapRecord`, so one sent is ignored.
+fn parse_writes(writes: Vec<serde_json::Value>) -> Result<Vec<WriteOp>, AppError> {
+    let invalid = |message: String| bad_request("InvalidRequest", message);
+    let mut ops = Vec::with_capacity(writes.len());
+    for (i, mut write) in writes.into_iter().enumerate() {
+        if !is_lexicon_write(&write) {
+            return Err(invalid(
+                "writes are tagged two ways; tag them all by $type, or all by action".into(),
+            ));
+        }
+        let action = write["$type"]
+            .as_str()
+            .and_then(|t| t.strip_prefix(LEXICON_WRITE_PREFIX))
+            .unwrap_or_default()
+            .to_string();
+        if !matches!(action.as_str(), "create" | "update" | "delete") {
+            return Err(invalid(format!(
+                "writes[{i}]: unknown write type {LEXICON_WRITE_PREFIX}{action}"
+            )));
+        }
+        if let Some(obj) = write.as_object_mut() {
+            obj.remove("$type");
+            obj.remove("swapRecord");
+            obj.insert("action".into(), action.into());
+        }
+        ops.push(
+            serde_json::from_value::<WriteOp>(write)
+                .map_err(|e| invalid(format!("writes[{i}]: {e}")))?,
+        );
+    }
+    Ok(ops)
+}
+
+/// A record key the caller chose, checked as the lexicons' `record-key`.
+fn check_rkey(rkey: &str) -> Result<(), AppError> {
+    if crate::xrpc::validate::is_record_key(rkey) {
+        Ok(())
+    } else {
+        Err(bad_request(
+            "InvalidRequest",
+            format!("{rkey:?} is not a valid record key"),
+        ))
+    }
+}
+
+fn record_already_exists(collection: &str, rkey: &str) -> AppError {
+    bad_request(
+        "RecordAlreadyExists",
+        format!("Record already exists: {collection}/{rkey}"),
+    )
+}
+
+fn record_not_found(collection: &str, rkey: &str) -> AppError {
+    bad_request(
+        "RecordNotFound",
+        format!("Record not found: {collection}/{rkey}"),
+    )
+}
+
+fn bad_request(code: &'static str, message: String) -> AppError {
+    AppError::XrpcError {
+        status: StatusCode::BAD_REQUEST,
+        code,
+        message,
+    }
 }
 
 #[derive(Deserialize)]
@@ -844,7 +1006,15 @@ async fn create_record(
     xrpc_claims: XrpcClaims,
     Json(input): Json<CreateRecordInput>,
 ) -> Result<Response, AppError> {
+    if let Some(rkey) = input.rkey.as_deref() {
+        check_rkey(rkey)?;
+    }
     let did = require_auth_or_credential(&state, &xrpc_claims).await?;
+    if input.repo.as_deref().is_some_and(|repo| repo != did) {
+        return Err(AppError::Forbidden(
+            "repo must be the authenticated account".into(),
+        ));
+    }
     authorize_space_write(
         &state,
         &xrpc_claims,
@@ -853,12 +1023,13 @@ async fn create_record(
         happyview_scopes::SpaceAction::Create,
     )
     .await?;
-    let (uri, cid) = service::create_record(
+    let (uri, cid) = service::create_record_at(
         &state,
         &did,
         xrpc_claims.space_credential.as_deref(),
         &input.space,
         &input.collection,
+        input.rkey.as_deref(),
         input.record,
     )
     .await?;
@@ -933,10 +1104,34 @@ async fn delete_record(
 async fn apply_writes(
     State(state): State<AppState>,
     xrpc_claims: XrpcClaims,
-    Json(input): Json<ApplyWritesInput>,
-) -> Result<Json<serde_json::Value>, AppError> {
+    Json(body): Json<serde_json::Value>,
+) -> Result<Response, AppError> {
+    let input = match read_apply_writes(body)? {
+        Ok(input) => input,
+        Err(refusal) => return Ok(refusal),
+    };
+    let (writes, shape) = (input.writes, input.shape);
     let did = require_auth_or_credential(&state, &xrpc_claims).await?;
-    for write in &input.writes {
+    if input.repo.as_deref().is_some_and(|repo| repo != did) {
+        return Err(AppError::Forbidden(
+            "repo must be the authenticated account".into(),
+        ));
+    }
+    // The lexicons' writes name record keys; the earlier shape's are read as
+    // they always were.
+    if shape == WritesShape::Lexicon {
+        for write in &writes {
+            if let WriteOp::Create {
+                rkey: Some(rkey), ..
+            }
+            | WriteOp::Update { rkey, .. }
+            | WriteOp::Delete { rkey, .. } = write
+            {
+                check_rkey(rkey)?;
+            }
+        }
+    }
+    for write in &writes {
         let (WriteOp::Create { collection, .. }
         | WriteOp::Update { collection, .. }
         | WriteOp::Delete { collection, .. }) = write;
@@ -956,7 +1151,7 @@ async fn apply_writes(
     // collection must not carry a write to another just because they arrived
     // together.
     if let Some(identity) = xrpc_claims.identity.as_ref() {
-        for write in &input.writes {
+        for write in &writes {
             let (collection, action) = match write {
                 WriteOp::Create { collection, .. } => {
                     (collection, happyview_scopes::SpaceAction::Create)
@@ -990,16 +1185,11 @@ async fn apply_writes(
         &space,
         &did,
         "com.atproto.space.applyWrites",
-        pds_apply_writes_body(
-            &space_uri,
-            &did,
-            input.swap_commit.as_deref(),
-            &input.writes,
-        ),
+        pds_apply_writes_body(&space_uri, &did, input.swap_commit.as_deref(), &writes),
     )
     .await?
     {
-        return Ok(Json(forwarded));
+        return Ok(Json(forwarded).into_response());
     }
 
     if let Some(ref expected_rev) = input.swap_commit {
@@ -1014,9 +1204,9 @@ async fn apply_writes(
         }
     }
 
-    let mut results = Vec::with_capacity(input.writes.len());
+    let mut results = Vec::with_capacity(writes.len());
     let rev = generate_tid();
-    let mut ops: Vec<service::AppliedOp> = Vec::with_capacity(input.writes.len());
+    let mut ops: Vec<service::AppliedOp> = Vec::with_capacity(writes.len());
 
     // Resolve the signing key before opening the transaction: provisioning the
     // `#atproto_space` key writes, and doing that on a second connection while a
@@ -1025,7 +1215,7 @@ async fn apply_writes(
 
     let mut tx = service::begin_space_write(&state, &space.id).await?;
 
-    for op in input.writes {
+    for op in writes {
         match op {
             WriteOp::Create {
                 collection,
@@ -1038,6 +1228,16 @@ async fn apply_writes(
                     "at://{}/space/{}/{}/{}/{}/{}",
                     space.did, space.type_nsid, space.skey, did, collection, rkey
                 );
+                // Read inside the batch, so a create after a create of the
+                // same key is refused too. The earlier shape keeps the 409 its
+                // insert gives.
+                if shape == WritesShape::Lexicon
+                    && db::get_space_record(&mut *tx, state.db_backend, &record_uri)
+                        .await?
+                        .is_some()
+                {
+                    return Err(record_already_exists(&collection, &rkey));
+                }
                 let record = SpaceRecord {
                     uri: record_uri.clone(),
                     space_id: space.id.clone(),
@@ -1088,6 +1288,11 @@ async fn apply_writes(
                         .await?
                         .map(|r| r.cid),
                 };
+                // The lexicons' update needs the record to exist; HappyView's
+                // earlier one creates it.
+                if shape == WritesShape::Lexicon && old_cid.is_none() {
+                    return Err(record_not_found(&collection, &rkey));
+                }
                 if let Some(swap_cid) = swap_record {
                     db::upsert_space_record_with_swap(
                         &mut tx,
@@ -1144,6 +1349,9 @@ async fn apply_writes(
                                 "You can only delete your own records".into(),
                             ));
                         }
+                        None if shape == WritesShape::Lexicon => {
+                            return Err(record_not_found(&collection, &rkey));
+                        }
                         None => return Err(AppError::NotFound("Record not found".into())),
                         Some(r) => r.cid,
                     };
@@ -1178,9 +1386,22 @@ async fn apply_writes(
 
     service::notify_ops(&state, &space, &did, &ops, &rev, committed).await;
 
+    // The lexicons' results name their type; HappyView's earlier ones don't.
+    if shape == WritesShape::Lexicon {
+        for (result, op) in results.iter_mut().zip(&ops) {
+            let kind = match op.action {
+                OplogAction::Create => "createResult",
+                OplogAction::Update => "updateResult",
+                OplogAction::Delete => "deleteResult",
+            };
+            result["$type"] = format!("{LEXICON_WRITE_PREFIX}{kind}").into();
+        }
+    }
+
     Ok(Json(serde_json::json!({
         "results": results,
-    })))
+    }))
+    .into_response())
 }
 
 /// `clearRecords`: delete every record in the caller's own repo in a space, in

@@ -587,6 +587,29 @@ pub(crate) async fn create_record(
     collection: &str,
     record: serde_json::Value,
 ) -> Result<(String, String), AppError> {
+    create_record_at(
+        state,
+        did,
+        space_credential,
+        space_ref,
+        collection,
+        None,
+        record,
+    )
+    .await
+}
+
+/// [`create_record`] at a key the caller chose, or a TID when `rkey` is
+/// `None`. A key that already holds a record is `RecordAlreadyExists`.
+pub(crate) async fn create_record_at(
+    state: &AppState,
+    did: &str,
+    space_credential: Option<&str>,
+    space_ref: &str,
+    collection: &str,
+    rkey: Option<&str>,
+    record: serde_json::Value,
+) -> Result<(String, String), AppError> {
     publish::refuse_direct_write(collection)?;
     let space = resolve_space(state, space_ref).await?;
     require_membership(state, &space, did, true, space_credential).await?;
@@ -595,19 +618,20 @@ pub(crate) async fn create_record(
         "at://{}/space/{}/{}",
         space.did, space.type_nsid, space.skey
     );
-    if let Some(forwarded) = forward_write_if_native(
-        state,
-        &space,
-        did,
-        "com.atproto.space.createRecord",
-        serde_json::json!({
-            "space": space_uri,
-            "repo": did,
-            "collection": collection,
-            "record": record,
-        }),
-    )
-    .await?
+    if let Some(forwarded) =
+        forward_write_if_native(state, &space, did, "com.atproto.space.createRecord", {
+            let mut body = serde_json::json!({
+                "space": space_uri,
+                "repo": did,
+                "collection": collection,
+                "record": record,
+            });
+            if let Some(rkey) = rkey {
+                body["rkey"] = rkey.into();
+            }
+            body
+        })
+        .await?
     {
         let uri = forwarded
             .get("uri")
@@ -622,7 +646,7 @@ pub(crate) async fn create_record(
         return Ok((uri, cid));
     }
 
-    let rkey = generate_tid();
+    let rkey = rkey.map_or_else(generate_tid, str::to_string);
     let cid = content_cid(&record)?;
     let record_uri = format!(
         "at://{}/space/{}/{}/{}/{}/{}",
@@ -651,6 +675,16 @@ pub(crate) async fn create_record(
     let signing_key = service_signing_key(state).await?;
 
     let mut tx = begin_space_write(state, &space.id).await?;
+    if db::get_space_record(&mut *tx, state.db_backend, &rec.uri)
+        .await?
+        .is_some()
+    {
+        return Err(AppError::XrpcError {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            code: "RecordAlreadyExists",
+            message: format!("Record already exists: {collection}/{}", rec.rkey),
+        });
+    }
     db::insert_space_record(&mut *tx, state.db_backend, &rec).await?;
     let committed = commit_write(
         &mut tx,

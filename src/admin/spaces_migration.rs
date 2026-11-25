@@ -100,7 +100,7 @@ async fn count_awaiting_authorization(state: &AppState) -> Result<i64, AppError>
         let scope = crate::jobs::native::migrate_space_repo::granted_scope(state, &did).await?;
         let has_space_grant = scope
             .as_deref()
-            .is_some_and(|s| s.split_whitespace().any(|t| t.starts_with("space:")));
+            .is_some_and(|s| s.split_whitespace().any(happyview_scopes::is_space_scope));
         if !has_space_grant {
             awaiting += 1;
         }

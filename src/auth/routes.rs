@@ -56,7 +56,10 @@ async fn enqueue_space_migrations(state: &AppState, did: &str) {
             return;
         }
     };
-    if !scope.split_whitespace().any(|s| s.starts_with("space:")) {
+    if !scope
+        .split_whitespace()
+        .any(happyview_scopes::is_space_scope)
+    {
         return;
     }
 
@@ -119,7 +122,7 @@ async fn drop_space_scopes_if_unsupported(
 
 fn is_space_scope(scope: &Scope) -> bool {
     match scope {
-        Scope::Unknown(value) => value == "space" || value.starts_with("space:"),
+        Scope::Unknown(value) => happyview_scopes::is_space_scope(value),
         _ => false,
     }
 }
@@ -809,6 +812,10 @@ mod space_scope_gate_tests {
         assert!(is_space_scope(&Scope::Unknown(
             "space:com.example.forum?action=read".into()
         )));
+        // The named form, by the Nov 12 parameter name.
+        assert!(is_space_scope(&Scope::Unknown(
+            "space?spaceType=com.example.forum&authority=*".into()
+        )));
         // `spaces:` is HappyView's internal admin permission prefix, not an
         // OAuth scope.
         assert!(!is_space_scope(&Scope::Unknown("spaces:manage".into())));
@@ -838,6 +845,7 @@ mod space_scope_gate_tests {
         let input = scopes(&[
             "atproto",
             "space:com.example.forum",
+            "space?spaceType=com.example.forum&authority=*",
             "repo:com.example.post",
         ]);
         let out = drop_space_scopes_if_unsupported(&state, "not a handle", input).await;
@@ -944,6 +952,22 @@ mod space_scope_gate_tests {
 
         enqueue_space_migrations(&state, MIGRATING_USER).await;
         assert_eq!(pending_jobs(&state).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_space_scope_granted_in_the_named_form_enqueues_too() {
+        let state = migration_state().await;
+        enable_migration(&state).await;
+        seed_session(
+            &state,
+            MIGRATING_USER,
+            Some("atproto space?spaceType=com.example.forum&authority=*"),
+        )
+        .await;
+        seed_polyfill_repo(&state, "space-a", MIGRATING_USER).await;
+
+        enqueue_space_migrations(&state, MIGRATING_USER).await;
+        assert_eq!(pending_jobs(&state).await, 1);
     }
 
     #[tokio::test]

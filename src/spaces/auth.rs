@@ -211,14 +211,22 @@ impl CheckMethod {
         Some(params)
     }
 
-    /// The app's decision, from its answer: `{read, write}` from
-    /// `checkAccess`, `{authorized}` from the older methods.
-    fn decision(self, answer: &serde_json::Value, access: AccessKind) -> bool {
-        let field = match self {
-            Self::Nov12 => access.as_str(),
-            Self::Oct29 | Self::Simplespace => "authorized",
-        };
-        answer.get(field).and_then(|v| v.as_bool()).unwrap_or(false)
+    /// The decision an answer gives, or `None` for an answer not in the
+    /// method's shape: `checkAccess` answers both `read` and `write` as
+    /// booleans, the older methods `authorized`.
+    fn decision(self, answer: &serde_json::Value, access: AccessKind) -> Option<bool> {
+        let flag = |field: &str| answer.get(field).and_then(|v| v.as_bool());
+        match self {
+            Self::Nov12 => {
+                let (read, write) = (flag("read")?, flag("write")?);
+                Some(if access.as_str() == "read" {
+                    read
+                } else {
+                    write
+                })
+            }
+            Self::Oct29 | Self::Simplespace => flag("authorized"),
+        }
     }
 }
 
@@ -384,7 +392,7 @@ async fn check_user_access_with_managing_app(
     let endpoint = resolve_service_identifier(http, auth_ctx.plc_url, managing_app)
         .await
         .ok_or_else(|| {
-            AppError::BadGateway(format!(
+            upstream_failure(format!(
                 "could not resolve the managing app {managing_app} to an endpoint"
             ))
         })?;
@@ -407,15 +415,36 @@ async fn check_user_access_with_managing_app(
         )
         .await?
         {
-            Answer::Decided(answer) => return Ok(method.decision(&answer, access)),
+            Answer::Decided(answer) => {
+                return method.decision(&answer, access).ok_or_else(|| {
+                    upstream_failure(format!(
+                        "the managing app {managing_app} sent a {} answer without its decision",
+                        method.nsid()
+                    ))
+                });
+            }
             Answer::Refused => return Ok(false),
             Answer::NotImplemented => continue,
         }
     }
-    Err(AppError::BadGateway(format!(
+    Err(upstream_failure(format!(
         "the managing app {managing_app} implements none of {}",
         CheckMethod::NEWEST_FIRST.map(CheckMethod::nsid).join(", ")
     )))
+}
+
+/// How long a managing app has to answer, as the reference space host allows.
+const MANAGING_APP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A managing app that couldn't be reached, timed out, failed, or answered
+/// outside its method's shape. The check fails as an upstream failure rather
+/// than a denial, so nothing is decided on it.
+fn upstream_failure(message: String) -> AppError {
+    AppError::XrpcError {
+        status: axum::http::StatusCode::BAD_GATEWAY,
+        code: "UpstreamFailure",
+        message,
+    }
 }
 
 /// A managing app's answer to one method.
@@ -487,13 +516,14 @@ async fn ask_managing_app(
         .get(&url)
         .query(params)
         .bearer_auth(&token)
+        .timeout(MANAGING_APP_TIMEOUT)
         .send()
         .await
         .map_err(|e| {
             // The transport error can name the app's endpoint; it goes to the
             // log, not to the caller.
             tracing::warn!(managing_app, error = %e, "could not reach the managing app");
-            AppError::BadGateway(format!(
+            upstream_failure(format!(
                 "the managing app {managing_app} could not be reached"
             ))
         })?;
@@ -520,13 +550,13 @@ async fn ask_managing_app(
     // Anything else is the managing app failing to answer, not a decision:
     // an upstream error, never one of ours.
     if !status.is_success() {
-        return Err(AppError::BadGateway(format!(
+        return Err(upstream_failure(format!(
             "the managing app {managing_app} answered {nsid} with {status}"
         )));
     }
     json.map(Answer::Decided).ok_or_else(|| {
         tracing::warn!(managing_app, "the managing app's answer is unreadable");
-        AppError::BadGateway(format!(
+        upstream_failure(format!(
             "the managing app {managing_app} sent an unreadable {nsid} answer"
         ))
     })
@@ -1364,13 +1394,33 @@ mod managing_app_tests {
     #[test]
     fn each_method_is_decided_by_its_own_answer() {
         let both = serde_json::json!({ "read": true, "write": false });
-        assert!(CheckMethod::Nov12.decision(&both, AccessKind::Read));
-        assert!(!CheckMethod::Nov12.decision(&both, AccessKind::Write));
+        assert_eq!(
+            CheckMethod::Nov12.decision(&both, AccessKind::Read),
+            Some(true)
+        );
+        assert_eq!(
+            CheckMethod::Nov12.decision(&both, AccessKind::Write),
+            Some(false)
+        );
         let authorized = serde_json::json!({ "authorized": true });
-        assert!(!CheckMethod::Nov12.decision(&authorized, AccessKind::Read));
+        // An answer outside the method's shape decides nothing.
+        assert_eq!(
+            CheckMethod::Nov12.decision(&authorized, AccessKind::Read),
+            None
+        );
+        let read_only = serde_json::json!({ "read": true });
+        assert_eq!(
+            CheckMethod::Nov12.decision(&read_only, AccessKind::Read),
+            None
+        );
+        let not_bools = serde_json::json!({ "read": "yes", "write": false });
+        assert_eq!(
+            CheckMethod::Nov12.decision(&not_bools, AccessKind::Write),
+            None
+        );
         for method in [CheckMethod::Oct29, CheckMethod::Simplespace] {
-            assert!(method.decision(&authorized, AccessKind::Read));
-            assert!(!method.decision(&both, AccessKind::Read));
+            assert_eq!(method.decision(&authorized, AccessKind::Read), Some(true));
+            assert_eq!(method.decision(&both, AccessKind::Read), None);
         }
     }
 

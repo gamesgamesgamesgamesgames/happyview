@@ -32,6 +32,7 @@ pub use resources::{
     ACCOUNT_ATTRIBUTES, AccountAction, AccountPermission, BlobPermission, IDENTITY_ATTRIBUTES,
     IdentityPermission, ManageOp, RepoAction, RepoPermission, RpcPermission, SpaceAction,
     SpacePermission, SpaceTarget, accept_covers, is_absolute_did_ref, is_accept, is_mime,
+    is_space_scope,
 };
 pub use syntax::ScopeSyntax;
 

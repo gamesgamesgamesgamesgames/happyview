@@ -1365,7 +1365,8 @@ async fn a_managing_app_on_an_earlier_revision_is_asked_with_its_method() {
 }
 
 /// An earlier revision's answer is read as that revision words it: an
-/// `{authorized}` answer from `checkAccess` decides nothing.
+/// `{authorized}` answer from `checkAccess` decides nothing, and is an
+/// upstream failure rather than a denial.
 #[tokio::test]
 #[serial]
 async fn a_check_access_answer_is_read_as_read_and_write() {
@@ -1375,7 +1376,7 @@ async fn a_check_access_answer_is_read_as_read_and_write() {
         wiremock::ResponseTemplate::new(200).set_body_json(json!({ "authorized": true })),
     ))
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(
         asked.len(),
         1,
@@ -1396,7 +1397,6 @@ async fn a_managing_app_refusing_denies_the_writer() {
             "write false",
             answers(200, json!({ "read": true, "write": false })),
         ),
-        ("no write field", answers(200, json!({}))),
     ] {
         let status = notify_through_managing_app(answer).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{label}");
@@ -1404,13 +1404,20 @@ async fn a_managing_app_refusing_denies_the_writer() {
 }
 
 /// A managing app that can't answer the access check is an upstream failure
-/// (502), not an error of ours (500), and admits no one: one that doesn't
-/// implement it, one whose answer isn't JSON, and one nobody can reach.
+/// (502 `UpstreamFailure`), not an error of ours (500) and not a denial, and
+/// admits no one: one that doesn't implement it, one whose answer isn't JSON
+/// or lacks its decision, and one nobody can reach.
 #[tokio::test]
 #[serial]
 async fn a_managing_app_that_cannot_answer_is_a_bad_gateway() {
     common::require_db!();
     for (label, answer) in [
+        ("no decision", answers(200, json!({}))),
+        ("no write field", answers(200, json!({ "read": true }))),
+        (
+            "a decision that isn't a boolean",
+            answers(200, json!({ "read": true, "write": "yes" })),
+        ),
         (
             "501",
             answers(
@@ -1426,8 +1433,9 @@ async fn a_managing_app_that_cannot_answer_is_a_bad_gateway() {
         ),
         ("a closed port", ManagingAppAnswer::Unreachable),
     ] {
-        let status = notify_through_managing_app(answer).await;
+        let (status, _, body) = through_managing_app(answer, Ask::NotifyWrite).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{label}");
+        assert_eq!(body["error"], json!("UpstreamFailure"), "{label}: {body}");
     }
 }
 
@@ -1796,4 +1804,37 @@ async fn mint_while_the_space_changes(
     .unwrap();
     assert_eq!(issued, 0);
     (status, body)
+}
+
+/// A credential request to a managed space whose app can't answer fails as
+/// an upstream failure too, and issues nothing.
+#[tokio::test]
+#[serial]
+async fn a_credential_request_meets_an_unanswering_app_as_an_upstream_failure() {
+    common::require_db!();
+    for (label, answer) in [
+        ("no decision", answers(200, json!({}))),
+        ("a closed port", ManagingAppAnswer::Unreachable),
+    ] {
+        let (status, _, body) = through_managing_app(answer, Ask::CredentialWithoutUser).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{label}: {body}");
+        assert_eq!(body["error"], json!("UpstreamFailure"), "{label}: {body}");
+        assert!(body.get("credential").is_none(), "{label}: {body}");
+    }
+}
+
+/// A managing app that takes longer than 10 seconds to answer is an upstream
+/// failure: its late answer, even one that admits, decides nothing.
+#[tokio::test]
+#[serial]
+async fn a_managing_app_that_answers_too_late_is_an_upstream_failure() {
+    common::require_db!();
+    let late = ManagingAppAnswer::Responds(
+        wiremock::ResponseTemplate::new(200)
+            .set_delay(std::time::Duration::from_secs(12))
+            .set_body_json(json!({ "read": true, "write": true })),
+    );
+    let (status, _, body) = through_managing_app(late, Ask::NotifyWrite).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"], json!("UpstreamFailure"), "{body}");
 }
