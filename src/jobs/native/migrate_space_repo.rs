@@ -259,14 +259,9 @@ async fn migrate(state: &AppState, job: &Job, input: &Input) -> Result<NativeOut
     let batches = replay_batches(&space_uri, &input.author_did, &records)
         .into_iter()
         .zip(records.chunks(BATCH_SIZE).map(<[SpaceRecord]>::len));
-    // The author's host, to name the space in the form it takes.
-    let pds = crate::spaces::auth::resolve_did_service_endpoint(
-        &state.http,
-        &state.config.plc_url,
-        &input.author_did,
-    )
-    .await
-    .ok();
+    // The author's host, the one the session calls, to name the space in
+    // the form it takes.
+    let pds = Some(atrium_xrpc::XrpcClient::base_uri(&session));
     let replayed = replay(state, job, batches, total, |body| {
         let session = &session;
         let pds = pds.as_deref();

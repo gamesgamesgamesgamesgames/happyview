@@ -551,14 +551,9 @@ pub(crate) async fn forward_write_if_native(
             ))
         })?;
 
-    // The space named in the form the author's host takes.
-    let pds = crate::spaces::auth::resolve_did_service_endpoint(
-        &state.http,
-        &state.config.plc_url,
-        author_did,
-    )
-    .await
-    .ok();
+    // The space named in the form the author's host, the one the session
+    // calls, takes.
+    let pds = Some(atrium_xrpc::XrpcClient::base_uri(&session));
     let space = body["space"].as_str().unwrap_or_default().to_string();
     let bytes =
         crate::spaces::pds_support::with_space_uri_form(state, pds.as_deref(), &space, |space| {
