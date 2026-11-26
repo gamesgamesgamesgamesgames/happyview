@@ -444,6 +444,13 @@ async fn check_user_access_with_managing_app(
                 Err(_) if answer.is_some() => break,
                 other => {
                     let this = other?;
+                    // Only a decision replaces the earlier form's denial: an
+                    // app that doesn't implement the method in this form, or
+                    // refuses it, leaves that denial final, rather than
+                    // sending the check on to an older method.
+                    if answer.is_some() && !matches!(this, Answer::Decided(_)) {
+                        break;
+                    }
                     let denied = matches!(&this, Answer::Decided(a)
                         if method.decision(a, access) == Some(false));
                     answer = Some(this);

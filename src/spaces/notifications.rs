@@ -642,7 +642,7 @@ async fn deliver_revocations(
         );
         for batch in jtis.chunks(MAX_REVOKED_PER_CALL) {
             // Addressed to the repo, which is what its host accepts service auth for.
-            let token = crate::spaces::authority::mint_service_auth_or_instance(
+            let token = match crate::spaces::authority::mint_service_auth_or_instance(
                 &state.db,
                 state.db_backend,
                 encryption_key,
@@ -651,7 +651,15 @@ async fn deliver_revocations(
                 &repo,
                 NOTIFY_CREDENTIAL_REVOKED_LXM,
             )
-            .await?;
+            .await
+            {
+                Ok(token) => token,
+                Err(e) => {
+                    // One repo's host is told nothing; the others still are.
+                    tracing::warn!(repo, error = %e, "could not authenticate a revocation");
+                    break;
+                }
+            };
             // The space named in the form the host takes; once more in the
             // other form if it refuses that one as malformed.
             let result = crate::spaces::pds_support::with_space_uri_form(

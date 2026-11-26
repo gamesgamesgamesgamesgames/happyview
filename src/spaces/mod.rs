@@ -323,9 +323,11 @@ mod tests {
         assert!(!is_space_reference("did:plc:abc123"));
         // A handle can't be written in the at:space/ form.
         let handle = "at://alice.example/space/com.example.forum/main";
-        if SpaceUri::parse(handle).is_ok() {
-            assert_eq!(UriForm::AtSpace.write(handle), handle);
-        }
+        assert!(
+            SpaceUri::parse(handle).is_ok(),
+            "the at:// form takes a handle"
+        );
+        assert_eq!(UriForm::AtSpace.write(handle), handle);
     }
 
     #[test]
