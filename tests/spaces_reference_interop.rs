@@ -120,9 +120,22 @@ impl Account {
         body["uri"].as_str().expect("space uri").to_string()
     }
 
+    /// A member-list space, created the way the host takes.
     async fn default_space(&self) -> String {
-        self.create_space(&Policy::MemberList, &Policy::MemberList, &AppAccess::Open)
-            .await
+        interop_support::create_space(
+            PDS,
+            &self.token,
+            "self",
+            json!({
+                "spaceType": "com.example.forum",
+                "type": "com.example.forum",
+                "skey": "self",
+                "readPolicy": Policy::MemberList,
+                "writePolicy": Policy::MemberList,
+                "appAccess": AppAccess::Open,
+            }),
+        )
+        .await
     }
 
     async fn write(&self, method: &str, space: &str, mut body: Value) -> Value {
@@ -440,6 +453,10 @@ async fn syncing_from_a_cursor_returns_only_later_ops() {
 #[tokio::test]
 #[ignore]
 async fn our_policy_and_app_access_unions_round_trip_through_the_reference_pds() {
+    if !interop_support::serves(PDS, "com.atproto.simplespace.createSpace").await {
+        eprintln!("this host serves no simplespace methods; nothing of theirs to check");
+        return;
+    }
     let account = Account::new().await;
     let read = Policy::Public;
     let write = Policy::ManagingApp {
@@ -470,6 +487,10 @@ async fn our_policy_and_app_access_unions_round_trip_through_the_reference_pds()
 #[tokio::test]
 #[ignore]
 async fn our_member_shape_round_trips_through_put_member_and_list_members() {
+    if !interop_support::serves(PDS, "com.atproto.simplespace.createSpace").await {
+        eprintln!("this host serves no simplespace methods; nothing of theirs to check");
+        return;
+    }
     let account = Account::new().await;
     let space = account.default_space().await;
     let other = Account::new().await;

@@ -377,3 +377,52 @@ pub async fn verified_latest_commit(
     )
     .unwrap_or_else(|e| panic!("the host's commit must verify with our own code: {e}"))
 }
+
+/// Whether `base` serves `method`: an unauthenticated call to it is refused
+/// as unauthenticated, rather than answered as a method it lacks.
+pub async fn serves(base: &str, method: &str) -> bool {
+    let status = reqwest::Client::new()
+        .post(format!("{base}/xrpc/{method}"))
+        .json(&json!({}))
+        .send()
+        .await
+        .map(|r| r.status().as_u16())
+        .unwrap_or(0);
+    matches!(status, 401 | 403)
+}
+
+/// A space of type `com.example.forum` under `skey`, created the way the host
+/// takes: `simplespace.createSpace` with `simplespace` as its body when the
+/// host serves it, as the harness always did, and otherwise the Nov 12
+/// `space.createSpace` with a member-list policy. The space's URI, in the
+/// form the host answers with.
+pub async fn create_space(base: &str, token: &str, skey: &str, simplespace: Value) -> String {
+    let (method, body) = if serves(base, "com.atproto.simplespace.createSpace").await {
+        ("com.atproto.simplespace.createSpace", simplespace)
+    } else {
+        (
+            "com.atproto.space.createSpace",
+            json!({
+                "spaceType": "com.example.forum",
+                "skey": skey,
+                "policy": { "$type": "com.atproto.memberspace.policy" },
+            }),
+        )
+    };
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/xrpc/{method}"))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{method}: {e}"));
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    assert!(status < 300, "{method} failed ({status}): {body}");
+    // `space` is the Nov 12 name; `uri` the earlier one.
+    body["space"]
+        .as_str()
+        .or_else(|| body["uri"].as_str())
+        .unwrap_or_else(|| panic!("{method} named no space: {body}"))
+        .to_string()
+}

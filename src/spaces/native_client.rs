@@ -111,6 +111,11 @@ where
 {
     let mut all: Vec<RepoOp> = Vec::new();
     let mut cursor: Option<String> = None;
+    // Whether this host pages by `since` rather than `cursor`, which shows as
+    // a repeated cursor. pds.js does. The spec gives `cursor` precedence, and
+    // a host that applies both drops ops sharing the last op's rev, so `since`
+    // is sent with a cursor only to a host that needs it.
+    let mut by_since = false;
     loop {
         let mut params = vec![
             ("space", space_uri.to_string()),
@@ -124,27 +129,33 @@ where
             }
             Some(c) => {
                 params.push(("cursor", c.clone()));
-                // Also the last rev seen, as `since`. The spec gives `cursor`
-                // precedence, so a conforming host ignores it; pds.js ignores
-                // `cursor` instead and pages by `since` alone, and without this
-                // re-serves the first page forever.
-                if let Some(last) = all.last() {
+                if by_since && let Some(last) = all.last() {
                     params.push(("since", last.rev.clone()));
                 }
             }
         }
 
         let (ops, next) = parse_repo_ops_page(&fetch(params).await?)?;
-        all.extend(ops);
 
         match next {
             Some(next) if Some(&next) == cursor.as_ref() => {
-                return Err(AppError::Internal(
-                    "listRepoOps returned the same cursor twice".into(),
-                ));
+                if by_since {
+                    return Err(AppError::Internal(
+                        "listRepoOps returned the same cursor twice".into(),
+                    ));
+                }
+                // The host ignored the cursor and served the first page
+                // again: ask again, by `since`, without keeping the repeat.
+                by_since = true;
             }
-            Some(next) => cursor = Some(next),
-            None => return Ok(all),
+            Some(next) => {
+                all.extend(ops);
+                cursor = Some(next);
+            }
+            None => {
+                all.extend(ops);
+                return Ok(all);
+            }
         }
     }
 }
@@ -547,9 +558,41 @@ mod tests {
         assert!(requests[0].contains(&("since", "3start".to_string())));
         assert!(requests[1].contains(&("cursor", "3a/0".to_string())));
         assert!(
-            requests[1].contains(&("since", "3a".to_string())),
-            "a continuation also carries the last rev, for hosts that ignore cursor"
+            !requests[1].iter().any(|(k, _)| *k == "since"),
+            "a host that applies both would drop ops sharing the last rev"
         );
+    }
+
+    /// A host that ignores `cursor` and pages by `since` (pds.js) serves the
+    /// first page again; it is asked once more with the last rev as `since`,
+    /// and the repeat isn't kept.
+    #[tokio::test]
+    async fn a_host_that_pages_by_since_is_asked_by_since() {
+        let requests = std::sync::Mutex::new(Vec::new());
+        let ops = collect_repo_ops(SPACE, AUTHOR, None, |params| {
+            requests.lock().unwrap().push(params.clone());
+            let since = params
+                .iter()
+                .find(|(k, _)| *k == "since")
+                .map(|(_, v)| v.clone());
+            async move {
+                Ok(match since.as_deref() {
+                    None => serde_json::json!({ "ops": [
+                        { "rev": "3a", "collection": "c.n", "rkey": "a", "cid": "bafya", "prev": null }
+                    ], "cursor": "3a" }),
+                    Some(_) => serde_json::json!({ "ops": [
+                        { "rev": "3b", "collection": "c.n", "rkey": "b", "cid": "bafyb", "prev": null }
+                    ] }),
+                })
+            }
+        })
+        .await
+        .expect("collects");
+        let rkeys: Vec<_> = ops.iter().map(|o| o.rkey.as_str()).collect();
+        assert_eq!(rkeys, ["a", "b"]);
+        let requests = requests.into_inner().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].contains(&("since", "3a".to_string())));
     }
 
     #[tokio::test]
