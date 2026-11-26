@@ -2290,3 +2290,141 @@ async fn notify_repo_update_has_no_admin_exception() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+/// A report forwards the repo's state as it names it: the flat fields over
+/// a `latest` beside them, and no record writes announced from a
+/// `collection` and `rkey` it carries.
+#[tokio::test]
+#[serial]
+async fn notify_repo_update_forwards_its_state_only() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+    let space = create_instance_space(&app, &instance_did).await;
+    let space_row = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        &instance_did,
+        SPACE_TYPE,
+        SPACE_SKEY,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let syncer = common::syncer::start().await;
+    happyview::spaces::notifications::register(
+        &app.state.db,
+        app.state.db_backend,
+        &space_row.id,
+        "did:web:syncer.example#atproto_space_syncer",
+        &syncer.uri(),
+        "did:web:syncer.example",
+        NotifyDelivery::Xrpc,
+    )
+    .await
+    .unwrap();
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            WRITER,
+            &instance_did,
+            "#atproto_space_host",
+            Some(REPO_UPDATE),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/xrpc/{REPO_UPDATE}"))
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .header("host", "127.0.0.1:0")
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": WRITER,
+                "repoRev": "3lzq2b3k4c22a",
+                "data": { "$bytes": DATA },
+                "latest": { "rev": "3lzq2b3k4c22b", "data": { "$bytes": "AAAA" } },
+                "collection": "com.example.post",
+                "rkey": "rk1",
+                "cid": "bafyreidefdycgbfy3oglcb6ism3eqhyp5llsrpzxjsuac2gsy4mtrtx244",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let received = common::syncer::received(&syncer, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let received_now = common::syncer::received(&syncer, 1).await;
+    assert_eq!(received.len(), 1);
+    assert_eq!(received_now.len(), 1, "only the repo's state is forwarded");
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(body["repoRev"], json!("3lzq2b3k4c22a"), "{body}");
+    assert!(body.get("collection").is_none(), "{body}");
+}
+
+/// A token addressed to this instance doesn't stand for a space whose
+/// authority is another DID, and a token naming some other service of the
+/// instance doesn't reach it at all.
+#[tokio::test]
+#[serial]
+async fn notify_repo_update_is_addressed_to_the_spaces_authority() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+    create_space(&app).await;
+    let instance_space = create_instance_space(&app, &instance_did).await;
+    let send = |auth: String, space: String| {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/xrpc/{REPO_UPDATE}"))
+            .header("content-type", "application/json")
+            .header("authorization", auth)
+            .header("host", "127.0.0.1:0")
+            .body(Body::from(
+                json!({ "space": space, "repo": WRITER, "repoRev": "3lzq2b3k4c22a", "data": { "$bytes": DATA } })
+                    .to_string(),
+            ))
+            .unwrap()
+    };
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            WRITER,
+            &instance_did,
+            "#atproto_space_host",
+            Some(REPO_UPDATE),
+        )
+        .await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(send(auth, space_uri()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            WRITER,
+            &instance_did,
+            "#atproto_labeler",
+            Some(REPO_UPDATE),
+        )
+        .await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(send(auth, instance_space))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}

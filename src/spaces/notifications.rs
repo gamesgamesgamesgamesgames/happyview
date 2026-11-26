@@ -743,14 +743,19 @@ const REPO_UPDATES_PER_HOUR: u32 = 1500;
 const REPO_UPDATES_PER_DAY: u32 = 10_000;
 
 /// The most senders tracked at once. Past it, senders whose day has ended
-/// are dropped; a new sender is refused only if none has.
+/// are dropped (at most once a minute), and otherwise the stalest of a few
+/// is, so a new sender is always counted.
 const MAX_REPO_UPDATE_SENDERS: usize = 100_000;
+/// How many tracked senders are looked at to choose one to drop.
+const EVICTION_SAMPLE: usize = 16;
 
 /// Per sender: the start of its current hour and day windows, and its calls
 /// in each.
 #[derive(Default)]
 pub struct SenderLimits {
     senders: dashmap::DashMap<String, [(i64, u32); 2]>,
+    /// When senders whose day has ended were last dropped.
+    last_sweep: std::sync::atomic::AtomicI64,
 }
 
 impl SenderLimits {
@@ -766,14 +771,28 @@ impl SenderLimits {
             (86_400, REPO_UPDATES_PER_DAY),
         ];
         if !self.senders.contains_key(sender) && self.senders.len() >= MAX_REPO_UPDATE_SENDERS {
-            self.senders
-                .retain(|_, windows| now - windows[1].0 < WINDOWS[1].0);
+            use std::sync::atomic::Ordering;
+            let last = self.last_sweep.load(Ordering::Relaxed);
+            if now - last >= 60
+                && self
+                    .last_sweep
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                self.senders
+                    .retain(|_, windows| now - windows[1].0 < WINDOWS[1].0);
+            }
             if self.senders.len() >= MAX_REPO_UPDATE_SENDERS {
-                return Err(AppError::RateLimited {
-                    retry_after: 60,
-                    limit: REPO_UPDATES_PER_HOUR,
-                    reset: (now + 60) as u64,
-                });
+                // The sender whose hour began longest ago, of a few.
+                let stalest = self
+                    .senders
+                    .iter()
+                    .take(EVICTION_SAMPLE)
+                    .min_by_key(|e| e.value()[0].0)
+                    .map(|e| e.key().clone());
+                if let Some(key) = stalest {
+                    self.senders.remove(&key);
+                }
             }
         }
         let mut entry = self
@@ -863,13 +882,16 @@ mod repo_update_limit_tests {
                 .charge_at(&format!("did:web:s{i}.example"), t)
                 .unwrap();
         }
-        // Full, with every sender's day still running: a new one waits.
-        assert!(limits.charge_at("did:web:new.example", t + 10).is_err());
-        // A known sender is still counted.
-        limits.charge_at("did:web:s0.example", t + 10).unwrap();
-        // Once their days end, they make room.
-        limits.charge_at("did:web:new.example", t + 86_400).unwrap();
-        assert!(limits.senders.len() <= 2, "{}", limits.senders.len());
+        // Full, with every sender's day still running: a new sender is
+        // counted, in place of one already tracked.
+        limits.charge_at("did:web:new.example", t + 10).unwrap();
+        assert_eq!(limits.senders.len(), MAX_REPO_UPDATE_SENDERS);
+        assert!(limits.senders.contains_key("did:web:new.example"));
+        // Once their days end, they're dropped together.
+        limits
+            .charge_at("did:web:later.example", t + 86_400)
+            .unwrap();
+        assert!(limits.senders.len() <= 3, "{}", limits.senders.len());
     }
 }
 

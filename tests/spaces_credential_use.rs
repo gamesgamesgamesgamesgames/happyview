@@ -1769,3 +1769,33 @@ async fn a_revocation_is_resent_under_the_singular_only_for_a_missing_method() {
     .await;
     assert_eq!(bodies.len(), 1, "{bodies:?}");
 }
+
+/// A 404, and an error named `XRPCNotSupported`, also mean the plural name
+/// is missing.
+#[tokio::test]
+#[serial]
+async fn a_revocation_falls_back_to_the_singular_name_on_any_missing_method_answer() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    common::require_db!();
+    for missing in [
+        ResponseTemplate::new(404),
+        ResponseTemplate::new(400)
+            .set_body_json(json!({ "error": "XRPCNotSupported", "message": "not supported" })),
+    ] {
+        let (_, bodies, app, _pds) = revocations_sent_to(
+            vec![
+                Mock::given(method("POST"))
+                    .and(path("/xrpc/com.atproto.space.notifyCredentialRevoked"))
+                    .respond_with(ResponseTemplate::new(200)),
+                Mock::given(method("POST"))
+                    .and(path("/xrpc/com.atproto.space.notifyCredentialsRevoked"))
+                    .respond_with(missing),
+            ],
+            2,
+        )
+        .await;
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        drop(app);
+    }
+}

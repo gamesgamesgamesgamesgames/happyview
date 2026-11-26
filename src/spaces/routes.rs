@@ -2581,6 +2581,21 @@ async fn notify_repo_update(
         .service_auth
         .as_ref()
         .and_then(|sa| sa.space_audience.clone());
+    let instance_fragment = claims
+        .service_auth
+        .as_ref()
+        .map(|sa| sa.aud_fragment.as_str())
+        .unwrap_or_default();
+    if audience.is_none()
+        && !matches!(
+            instance_fragment,
+            "" | "#atproto_pds" | "#atproto_space_host"
+        )
+    {
+        return Err(AppError::Forbidden(
+            "service auth must be addressed to the space's host".into(),
+        ));
+    }
     if audience.is_none()
         && let Ok(space) = service::resolve_space(&state, &input.space).await
     {
@@ -2592,11 +2607,9 @@ async fn notify_repo_update(
         .await
         .ok();
         if instance.as_deref() != Some(space.authority_did.as_str()) {
-            return Err(AppError::XrpcError {
-                status: StatusCode::UNAUTHORIZED,
-                code: "BadServiceAudience",
-                message: "service auth must be addressed to the space's authority".into(),
-            });
+            return Err(AppError::Forbidden(
+                "service auth must be addressed to the space's authority".into(),
+            ));
         }
     }
     notify_write(State(state), claims, Json(input))
