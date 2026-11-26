@@ -380,9 +380,14 @@ async fn atproto_pds_serves_only_the_canonical_member_method() {
         assert!(methods.contains(&"com.atproto.simplespace.putMember"));
         assert!(!methods.contains(&"com.atproto.simplespace.addMember"));
     } else {
-        // The Nov 12 generation: member lists are memberspace's.
+        // The Nov 12 generation: member lists are memberspace's, under the
+        // canonical names only.
         assert!(
             methods.contains(&"com.atproto.memberspace.putMembers"),
+            "{methods:?}"
+        );
+        assert!(
+            !methods.contains(&"com.atproto.memberspace.addMembers"),
             "{methods:?}"
         );
     }
@@ -391,7 +396,7 @@ async fn atproto_pds_serves_only_the_canonical_member_method() {
 #[tokio::test]
 #[ignore]
 async fn atproto_pds_stores_split_read_and_write_policies() {
-    if !interop_support::serves(PDS, "com.atproto.simplespace.createSpace").await {
+    if interop_support::generation(PDS).await != interop_support::Generation::Simplespace {
         eprintln!("this host serves no simplespace methods; nothing of theirs to check");
         return;
     }
