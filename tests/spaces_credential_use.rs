@@ -1747,3 +1747,25 @@ async fn a_revocation_falls_back_to_the_singular_name() {
         json!(happyview::spaces::UriForm::AtSpace.write(&space))
     );
 }
+
+/// A refusal that only mentions a 404 in its text isn't taken for a method
+/// the host lacks.
+#[tokio::test]
+#[serial]
+async fn a_revocation_is_resent_under_the_singular_only_for_a_missing_method() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    common::require_db!();
+    let (_, bodies, _app, _pds) = revocations_sent_to(
+        vec![
+            Mock::given(method("POST"))
+                .and(path("/xrpc/com.atproto.space.notifyCredentialsRevoked"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(
+                    json!({ "error": "InvalidRequest", "message": "credential list 404 entries long" }),
+                )),
+        ],
+        1,
+    )
+    .await;
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+}

@@ -2538,21 +2538,66 @@ async fn notify_repo_update(
     claims: XrpcClaims,
     Json(mut input): Json<NotifyWriteInput>,
 ) -> Result<axum::response::Response, AppError> {
-    let sender = require_notify_caller(&claims)?;
-    crate::spaces::notifications::charge_repo_update_sender(&sender)?;
+    // Sent by repo hosts, as service auth signed as the repo that advanced:
+    // no session or other account reports a repo's state.
+    let sender = claims
+        .service_auth
+        .as_ref()
+        .map(|sa| sa.did.clone())
+        .ok_or_else(|| AppError::Auth("service auth from the repo is required".into()))?;
+    state.repo_update_senders.charge(&sender)?;
     let invalid = |message: &str| AppError::XrpcError {
         status: StatusCode::BAD_REQUEST,
         code: "InvalidRequest",
         message: message.into(),
     };
-    if let Some(latest) = input.latest.take() {
-        input.repo_rev.get_or_insert(latest.rev);
-        if input.data.is_none() {
-            input.data = Some(latest.data);
-        }
+    // zds 0.9's state, taken whole, and only when the flat fields are absent.
+    if let Some(latest) = input.latest.take()
+        && input.repo_rev.is_none()
+        && input.data.is_none()
+    {
+        input.repo_rev = Some(latest.rev);
+        input.data = Some(latest.data);
     }
-    if input.repo.is_none() || input.repo_rev.is_none() || input.data.is_none() {
+    // A report names the repo's state, not a record, so nothing is announced
+    // from it.
+    input.did = None;
+    input.collection = None;
+    input.rkey = None;
+    input.cid = None;
+    let (Some(repo), Some(rev), Some(_)) = (&input.repo, &input.repo_rev, &input.data) else {
         return Err(invalid("repo, repoRev and data are required"));
+    };
+    if *repo != sender {
+        return Err(AppError::Forbidden(
+            "a repo update is reported by the repo it names".into(),
+        ));
+    }
+    crate::spaces::writers::check_rev_not_future(rev)?;
+    // Addressed to the space's authority (or its space host). A token
+    // addressed to this instance stands for that only when the instance is
+    // the authority.
+    let audience = claims
+        .service_auth
+        .as_ref()
+        .and_then(|sa| sa.space_audience.clone());
+    if audience.is_none()
+        && let Ok(space) = service::resolve_space(&state, &input.space).await
+    {
+        let instance = crate::auth::service_auth::instance_did(
+            &state.db,
+            state.db_backend,
+            &state.config.public_url,
+        )
+        .await
+        .ok();
+        if instance.as_deref() != Some(space.authority_did.as_str()) {
+            return Err(AppError::XrpcError {
+                status: StatusCode::UNAUTHORIZED,
+                code: "BadServiceAudience",
+                message: "service auth must be addressed to the space's authority".into(),
+            });
+        }
     }
     notify_write(State(state), claims, Json(input))
         .await

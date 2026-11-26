@@ -575,15 +575,30 @@ const NOTIFY_CREDENTIALS_REVOKED_LXMS: [&str; 2] = [
     "com.atproto.space.notifyCredentialRevoked",
 ];
 
-/// Whether a host's answer says it doesn't implement the method called.
+/// Whether a host's answer to a revocation says it doesn't implement the
+/// method called: a 404 or 501, or an error named so.
 fn method_not_implemented(err: &AppError) -> bool {
-    let text = err.to_string();
-    text.contains(" 404 ")
-        || text.contains(" 501 ")
-        || text.contains("MethodNotImplemented")
-        || text.contains("Method Not Implemented")
-        || text.contains("XRPCNotSupported")
+    match err {
+        AppError::XrpcError {
+            status,
+            code: REVOCATION_REFUSED,
+            message,
+        } => {
+            matches!(status.as_u16(), 404 | 501)
+                || serde_json::from_str::<serde_json::Value>(message)
+                    .ok()
+                    .and_then(|body| body.get("error")?.as_str().map(str::to_string))
+                    .is_some_and(|e| {
+                        matches!(e.as_str(), "MethodNotImplemented" | "XRPCNotSupported")
+                    })
+        }
+        _ => false,
+    }
 }
+
+/// The code a repo host's refusal of a revocation is carried under, with its
+/// status and its body as the message.
+const REVOCATION_REFUSED: &str = "RevocationRefused";
 
 /// How many `jti`s one `notifyCredentialRevoked` call may carry.
 const MAX_REVOKED_PER_CALL: usize = 100;
@@ -693,9 +708,12 @@ async fn deliver_revocations(
                                 return Ok(());
                             }
                             let body = resp.text().await.unwrap_or_default();
-                            Err(AppError::Internal(format!(
-                                "repo host answered a revocation with {status}: {body}"
-                            )))
+                            Err(AppError::XrpcError {
+                                status: axum::http::StatusCode::from_u16(status.as_u16())
+                                    .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
+                                code: REVOCATION_REFUSED,
+                                message: body,
+                            })
                         }
                     },
                 )
@@ -724,44 +742,64 @@ async fn deliver_revocations(
 const REPO_UPDATES_PER_HOUR: u32 = 1500;
 const REPO_UPDATES_PER_DAY: u32 = 10_000;
 
+/// The most senders tracked at once. Past it, senders whose day has ended
+/// are dropped; a new sender is refused only if none has.
+const MAX_REPO_UPDATE_SENDERS: usize = 100_000;
+
 /// Per sender: the start of its current hour and day windows, and its calls
 /// in each.
-static REPO_UPDATE_SENDERS: std::sync::LazyLock<dashmap::DashMap<String, [(i64, u32); 2]>> =
-    std::sync::LazyLock::new(dashmap::DashMap::new);
-
-/// Count a `notifyRepoUpdate` from `sender`, refusing it as `RateLimited`
-/// once the sender is over either limit.
-pub fn charge_repo_update_sender(sender: &str) -> Result<(), AppError> {
-    charge_repo_update_sender_at(sender, chrono::Utc::now().timestamp())
+#[derive(Default)]
+pub struct SenderLimits {
+    senders: dashmap::DashMap<String, [(i64, u32); 2]>,
 }
 
-fn charge_repo_update_sender_at(sender: &str, now: i64) -> Result<(), AppError> {
-    const WINDOWS: [(i64, u32); 2] = [
-        (3600, REPO_UPDATES_PER_HOUR),
-        (86_400, REPO_UPDATES_PER_DAY),
-    ];
-    let mut entry = REPO_UPDATE_SENDERS
-        .entry(sender.to_string())
-        .or_insert([(now, 0), (now, 0)]);
-    for (i, (length, _)) in WINDOWS.iter().enumerate() {
-        if now - entry[i].0 >= *length {
-            entry[i] = (now, 0);
+impl SenderLimits {
+    /// Count a `notifyRepoUpdate` from `sender`, refusing it as
+    /// `RateLimited` once the sender is over either limit.
+    pub fn charge(&self, sender: &str) -> Result<(), AppError> {
+        self.charge_at(sender, chrono::Utc::now().timestamp())
+    }
+
+    fn charge_at(&self, sender: &str, now: i64) -> Result<(), AppError> {
+        const WINDOWS: [(i64, u32); 2] = [
+            (3600, REPO_UPDATES_PER_HOUR),
+            (86_400, REPO_UPDATES_PER_DAY),
+        ];
+        if !self.senders.contains_key(sender) && self.senders.len() >= MAX_REPO_UPDATE_SENDERS {
+            self.senders
+                .retain(|_, windows| now - windows[1].0 < WINDOWS[1].0);
+            if self.senders.len() >= MAX_REPO_UPDATE_SENDERS {
+                return Err(AppError::RateLimited {
+                    retry_after: 60,
+                    limit: REPO_UPDATES_PER_HOUR,
+                    reset: (now + 60) as u64,
+                });
+            }
         }
-    }
-    for (i, (length, limit)) in WINDOWS.iter().enumerate() {
-        if entry[i].1 >= *limit {
-            let reset = (entry[i].0 + length).max(now) as u64;
-            return Err(AppError::RateLimited {
-                retry_after: reset - now as u64,
-                limit: *limit,
-                reset,
-            });
+        let mut entry = self
+            .senders
+            .entry(sender.to_string())
+            .or_insert([(now, 0), (now, 0)]);
+        for (i, (length, _)) in WINDOWS.iter().enumerate() {
+            if now - entry[i].0 >= *length {
+                entry[i] = (now, 0);
+            }
         }
+        for (i, (length, limit)) in WINDOWS.iter().enumerate() {
+            if entry[i].1 >= *limit {
+                let reset = (entry[i].0 + length).max(now) as u64;
+                return Err(AppError::RateLimited {
+                    retry_after: reset - now as u64,
+                    limit: *limit,
+                    reset,
+                });
+            }
+        }
+        for counted in entry.iter_mut() {
+            counted.1 += 1;
+        }
+        Ok(())
     }
-    for counted in entry.iter_mut() {
-        counted.1 += 1;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -770,12 +808,13 @@ mod repo_update_limit_tests {
 
     #[test]
     fn a_sender_is_limited_per_hour_and_per_day() {
+        let limits = SenderLimits::default();
         let sender = format!("did:plc:{}", uuid::Uuid::new_v4().simple());
         let t = 1_000_000;
         for _ in 0..REPO_UPDATES_PER_HOUR {
-            charge_repo_update_sender_at(&sender, t).unwrap();
+            limits.charge_at(&sender, t).unwrap();
         }
-        let err = charge_repo_update_sender_at(&sender, t + 10).unwrap_err();
+        let err = limits.charge_at(&sender, t + 10).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -788,7 +827,7 @@ mod repo_update_limit_tests {
             "{err:?}"
         );
         // Another sender is untouched.
-        charge_repo_update_sender_at(&format!("{sender}x"), t).unwrap();
+        limits.charge_at(&format!("{sender}x"), t).unwrap();
 
         // The next hour admits it again, until the day's limit.
         let mut now = t;
@@ -796,11 +835,11 @@ mod repo_update_limit_tests {
         while admitted < REPO_UPDATES_PER_DAY {
             now += 3600;
             for _ in 0..REPO_UPDATES_PER_HOUR.min(REPO_UPDATES_PER_DAY - admitted) {
-                charge_repo_update_sender_at(&sender, now).unwrap();
+                limits.charge_at(&sender, now).unwrap();
                 admitted += 1;
             }
         }
-        let err = charge_repo_update_sender_at(&sender, now + 3600).unwrap_err();
+        let err = limits.charge_at(&sender, now + 3600).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -812,7 +851,25 @@ mod repo_update_limit_tests {
             "{err:?}"
         );
         // A day on, it is admitted.
-        charge_repo_update_sender_at(&sender, t + 86_400).unwrap();
+        limits.charge_at(&sender, t + 86_400).unwrap();
+    }
+
+    #[test]
+    fn the_senders_tracked_are_bounded() {
+        let limits = SenderLimits::default();
+        let t = 1_000_000;
+        for i in 0..MAX_REPO_UPDATE_SENDERS {
+            limits
+                .charge_at(&format!("did:web:s{i}.example"), t)
+                .unwrap();
+        }
+        // Full, with every sender's day still running: a new one waits.
+        assert!(limits.charge_at("did:web:new.example", t + 10).is_err());
+        // A known sender is still counted.
+        limits.charge_at("did:web:s0.example", t + 10).unwrap();
+        // Once their days end, they make room.
+        limits.charge_at("did:web:new.example", t + 86_400).unwrap();
+        assert!(limits.senders.len() <= 2, "{}", limits.senders.len());
     }
 }
 
