@@ -1108,6 +1108,10 @@ enum ManagingAppAnswer {
     /// It answers this to a space named in the `at:space/` form, and that to
     /// the `at://…/space/…` form.
     AnswersByForm(wiremock::ResponseTemplate, wiremock::ResponseTemplate),
+    /// It denies a space named in the `at:space/` form, doesn't implement
+    /// `checkAccess` for the earlier form (404), and would admit through
+    /// any older method.
+    DeniesAtSpaceOlderAdmit,
 }
 
 /// A request naming its space in the `at:space/` form.
@@ -1202,6 +1206,32 @@ async fn through_managing_app(
             Mock::given(method("GET"))
                 .respond_with(legacy)
                 .with_priority(2)
+                .mount(&managing_app)
+                .await;
+            managing_app.uri()
+        }
+        ManagingAppAnswer::DeniesAtSpaceOlderAdmit => {
+            Mock::given(method("GET"))
+                .and(NamesAtSpace)
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(json!({ "read": false, "write": false })),
+                )
+                .with_priority(1)
+                .mount(&managing_app)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/xrpc/com.atproto.managedspace.checkAccess"))
+                .respond_with(wiremock::ResponseTemplate::new(404))
+                .with_priority(2)
+                .mount(&managing_app)
+                .await;
+            Mock::given(method("GET"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(json!({ "authorized": true, "read": true, "write": true })),
+                )
+                .with_priority(3)
                 .mount(&managing_app)
                 .await;
             managing_app.uri()
@@ -1961,4 +1991,24 @@ async fn check_access_denied_as_at_space_is_asked_as_before() {
         "a denial, not a failure: {body}"
     );
     assert_eq!(asked.len(), 2, "{asked:?}");
+}
+
+/// A denial in the `at:space/` form is final when the app doesn't implement
+/// the method for the earlier form: the check isn't sent on to an older
+/// method that might admit.
+#[tokio::test]
+#[serial]
+async fn a_denial_is_not_reopened_by_an_older_method() {
+    common::require_db!();
+    let (status, asked, body) =
+        through_managing_app(ManagingAppAnswer::DeniesAtSpaceOlderAdmit, Ask::NotifyWrite).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        asked,
+        vec![
+            "com.atproto.managedspace.checkAccess".to_string(),
+            "com.atproto.managedspace.checkAccess".to_string()
+        ],
+        "no older method is asked"
+    );
 }

@@ -513,12 +513,14 @@ pub fn refuses_space_uri_form(err: &AppError) -> bool {
     // What names the `space` parameter's value, as lexicon validation and the
     // hosts word it, rather than any mention of a space (a method's NSID
     // has one).
-    const NAMES_THE_SPACE: [&str; 6] = [
+    const NAMES_THE_SPACE: [&str; 8] = [
         "space-ref",
         "space uri",
         "space ref",
         "input/space",
         "params/space",
+        "space must",
+        "invalid space",
         ": space",
     ];
     text.contains("invalidspaceuri")
@@ -555,8 +557,11 @@ where
             let answer = call(other.write(space_uri)).await;
             if answer.is_ok()
                 && let Some(pds) = pds
+                && let Err(e) = record_space_uri_form(state, pds, other).await
             {
-                record_space_uri_form(state, pds, other).await?;
+                // The call succeeded; failing to remember the form only
+                // costs a refusal next time.
+                tracing::warn!(pds, error = %e, "could not record a host's space URI form");
             }
             answer
         }

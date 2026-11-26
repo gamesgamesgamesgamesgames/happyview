@@ -575,7 +575,7 @@ async fn revocations_sent_to(
 
     let mut app = TestApp::new_with_encryption().await;
     let key = key();
-    let (space, credential) = setup(&mut app, &key).await;
+    let (space, _) = setup(&mut app, &key).await;
 
     let pds = MockServer::start().await;
     for mock in host {
@@ -643,7 +643,6 @@ async fn revocations_sent_to(
         .iter()
         .map(|r| serde_json::from_slice(&r.body).unwrap())
         .collect();
-    let _ = credential;
     (space, bodies, app, pds.uri())
 }
 
