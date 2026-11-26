@@ -629,9 +629,8 @@ async fn revocations_sent_to(
         json!({ "space": space, "dids": [MEMBER] }),
     )
     .await;
-    let mut received = Vec::new();
     for _ in 0..50 {
-        received = pds.received_requests().await.unwrap_or_default();
+        let received = pds.received_requests().await.unwrap_or_default();
         if received.len() >= expected {
             break;
         }
