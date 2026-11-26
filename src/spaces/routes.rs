@@ -100,6 +100,15 @@ struct NotifyWriteInput {
     collection: Option<String>,
     rkey: Option<String>,
     cid: Option<String>,
+    /// zds 0.9's `notifyRepoUpdate` carried the repo's state as `latest`,
+    /// before the Nov 12 text flattened it into `repoRev` and `data`.
+    latest: Option<LatestRepoState>,
+}
+
+#[derive(Deserialize)]
+struct LatestRepoState {
+    rev: String,
+    data: LexBytes,
 }
 
 /// A lexicon `bytes` value, encoded in JSON as `{"$bytes": "<base64>"}`.
@@ -603,11 +612,20 @@ pub(crate) fn protocol_method_table() -> Vec<(String, MethodRouter<AppState>)> {
         (format!("{PROTO_NS}.space.listBlobs"), get(list_blobs)),
         (format!("{PROTO_NS}.space.notifyWrite"), post(notify_write)),
         (
+            format!("{PROTO_NS}.space.notifyRepoUpdate"),
+            post(notify_repo_update),
+        ),
+        (
             format!("{PROTO_NS}.space.notifySpaceDeleted"),
             post(notify_space_deleted),
         ),
         (
             format!("{PROTO_NS}.space.notifyCredentialRevoked"),
+            post(notify_credential_revoked),
+        ),
+        // The Nov 12 name; the singular is the earlier one.
+        (
+            format!("{PROTO_NS}.space.notifyCredentialsRevoked"),
             post(notify_credential_revoked),
         ),
         (format!("{PROTO_NS}.space.getBlob"), get(get_space_blob)),
@@ -2509,6 +2527,36 @@ async fn list_blobs(
         body["cursor"] = serde_json::Value::String(cursor);
     }
     Ok(Json(body))
+}
+
+/// `notifyRepoUpdate`: a repo host's report that a repo advanced, in the
+/// shape the Nov 12 text gives `notifyWrite`'s spec form. Handled as that
+/// form is (including `FutureRev`), with the checks the method adds: every
+/// field is required, and each sender is limited.
+async fn notify_repo_update(
+    State(state): State<AppState>,
+    claims: XrpcClaims,
+    Json(mut input): Json<NotifyWriteInput>,
+) -> Result<axum::response::Response, AppError> {
+    let sender = require_notify_caller(&claims)?;
+    crate::spaces::notifications::charge_repo_update_sender(&sender)?;
+    let invalid = |message: &str| AppError::XrpcError {
+        status: StatusCode::BAD_REQUEST,
+        code: "InvalidRequest",
+        message: message.into(),
+    };
+    if let Some(latest) = input.latest.take() {
+        input.repo_rev.get_or_insert(latest.rev);
+        if input.data.is_none() {
+            input.data = Some(latest.data);
+        }
+    }
+    if input.repo.is_none() || input.repo_rev.is_none() || input.data.is_none() {
+        return Err(invalid("repo, repoRev and data are required"));
+    }
+    notify_write(State(state), claims, Json(input))
+        .await
+        .map(IntoResponse::into_response)
 }
 
 async fn notify_write(

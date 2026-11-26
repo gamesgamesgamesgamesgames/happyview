@@ -2012,3 +2012,117 @@ async fn a_denial_is_not_reopened_by_an_older_method() {
         "no older method is asked"
     );
 }
+
+/// Send `body` (with `space` filled in) to `method` with service auth signed
+/// by `signer` and bound to `lxm`, returning the status and body.
+async fn notify_as(
+    method: &str,
+    signer: &str,
+    lxm: Option<&str>,
+    mut body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let mut app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+    body["space"] = json!(create_instance_space(&app, &instance_did).await);
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            signer,
+            &instance_did,
+            "#atproto_space_host",
+            lxm,
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/xrpc/{method}"))
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .header("host", "127.0.0.1:0")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+const REPO_UPDATE: &str = "com.atproto.space.notifyRepoUpdate";
+const DATA: &str = "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80";
+
+/// A repo host on the Nov 12 text reports a repo's new state with
+/// `notifyRepoUpdate`, which is taken as `notifyWrite`'s spec shape is.
+#[tokio::test]
+#[serial]
+async fn notify_repo_update_is_taken_as_notify_write() {
+    common::require_db!();
+    let writer = "did:plc:writer";
+    let (status, body) = notify_as(
+        REPO_UPDATE,
+        writer,
+        Some(REPO_UPDATE),
+        json!({ "repo": writer, "repoRev": "3lzq2b3k4c22a", "data": { "$bytes": DATA } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // zds 0.9's shape, with the state under `latest`.
+    let (status, body) = notify_as(
+        REPO_UPDATE,
+        writer,
+        Some(REPO_UPDATE),
+        json!({ "repo": writer, "latest": { "rev": "3lzq2b3k4c22a", "data": { "$bytes": DATA } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+#[serial]
+async fn notify_repo_update_refuses_an_incomplete_or_future_report() {
+    common::require_db!();
+    let writer = "did:plc:writer";
+    let (status, body) = notify_as(
+        REPO_UPDATE,
+        writer,
+        Some(REPO_UPDATE),
+        json!({ "repo": writer, "repoRev": "3lzq2b3k4c22a" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], json!("InvalidRequest"), "{body}");
+
+    // A TID in the year 2100.
+    let (status, body) = notify_as(
+        REPO_UPDATE,
+        writer,
+        Some(REPO_UPDATE),
+        json!({ "repo": writer, "repoRev": "7zzzzzzzzzzzz", "data": { "$bytes": DATA } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], json!("FutureRev"), "{body}");
+}
+
+/// Service auth bound to `notifyWrite` doesn't reach `notifyRepoUpdate`.
+#[tokio::test]
+#[serial]
+async fn notify_repo_update_needs_auth_bound_to_it() {
+    common::require_db!();
+    let writer = "did:plc:writer";
+    let (status, body) = notify_as(
+        REPO_UPDATE,
+        writer,
+        Some("com.atproto.space.notifyWrite"),
+        json!({ "repo": writer, "repoRev": "3lzq2b3k4c22a", "data": { "$bytes": DATA } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+}
