@@ -687,6 +687,8 @@ async fn a_revocation_falls_back_to_the_earlier_form_only_when_the_form_is_refus
             .unwrap(),
         happyview::spaces::UriForm::Legacy
     );
+    // One app holds the test database at a time.
+    drop(app);
 
     let (_, bodies, app, pds) = revocations_sent_to(
         vec![Mock::given(method("POST")).and(path(lxm)).respond_with(
