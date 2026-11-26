@@ -1,0 +1,17 @@
+{
+  "_comment": "Nov 12 commit MACs computed with @atproto/space mac.ts's header and signature-base logic over structured-headers 1.0.1 (the reference's version), secret 32 bytes of 0x09, key share did:key:zDnaExample, commit ver=1 repo=did:example:alice space=at:space/did:example:space/app.bsky.group/test rev=3kbcq3p7ad400 data=32 bytes of 0x01.",
+  "vectors": [
+    {
+      "request": "mac=(\"atproto-space-commit\";sf);keyid=\"did:key:zDnaExample\";tag=\"atproto-space-commit\"",
+      "commit": "ver=1, repo=\"did:example:alice\", space=\"at:space/did:example:space/app.bsky.group/test\", rev=\"3kbcq3p7ad400\", data=:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=:",
+      "signature_input": "mac=(\"atproto-space-commit\";sf);keyid=\"did:key:zDnaExample\";tag=\"atproto-space-commit\"",
+      "signature": "mac=:DASUOSwPtDqr50vw2jMhTdeecI5RdU3XoEtYM0zwFko=:"
+    },
+    {
+      "request": "sig1=(\"atproto-space-commit\";sf);tag=\"atproto-space-commit\";created=1700000000;keyid=\"did:key:zDnaExample\";alg=\"hmac-sha256\"",
+      "commit": "ver=1, repo=\"did:example:alice\", space=\"at:space/did:example:space/app.bsky.group/test\", rev=\"3kbcq3p7ad400\", data=:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=:",
+      "signature_input": "sig1=(\"atproto-space-commit\";sf);tag=\"atproto-space-commit\";created=1700000000;keyid=\"did:key:zDnaExample\";alg=\"hmac-sha256\"",
+      "signature": "sig1=:AcyiRxvfeDyI8wZ4TQupEpXTlV8PMtPFvMCBmgGsADU=:"
+    }
+  ]
+}

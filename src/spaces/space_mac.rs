@@ -215,6 +215,8 @@ pub fn parse_mac_header(value: &str) -> Result<[u8; 32], AppError> {
 /// The profile a commit MAC is requested and answered under, and the header
 /// it covers.
 pub const COMMIT_MAC_PROFILE: &str = "atproto-space-commit";
+/// The header a commit MAC covers, describing the commit.
+pub const COMMIT_MAC_HEADER: &str = "atproto-space-commit";
 pub const ACCEPT_SIGNATURE_HEADER: &str = "accept-signature";
 pub const SIGNATURE_INPUT_HEADER: &str = "signature-input";
 pub const SIGNATURE_HEADER: &str = "signature";
@@ -386,11 +388,11 @@ pub fn verify_commit_signature(
         return Err(refused("names another key share"));
     }
 
-    let fields = parse_dict(headers.commit, COMMIT_MAC_PROFILE)?;
+    let fields = parse_dict(headers.commit, COMMIT_MAC_HEADER)?;
     use sfv::FieldType;
     let covered = fields
         .serialize()
-        .ok_or_else(|| refused(&format!("has an empty {COMMIT_MAC_PROFILE} header")))?;
+        .ok_or_else(|| refused(&format!("has an empty {COMMIT_MAC_HEADER} header")))?;
     let signature_params =
         serialize_inner_list(input).ok_or_else(|| refused("has empty parameters"))?;
     let base = commit_signature_base(&covered, &signature_params);
@@ -459,11 +461,18 @@ pub fn verify_commit_response(
             .collect::<Result<Vec<_>, _>>()?;
         Ok((!values.is_empty()).then(|| values.join(", ")))
     };
-    if let (Some(commit_header), Some(signature_input), Some(signature)) = (
-        text(COMMIT_MAC_PROFILE)?,
-        text(SIGNATURE_INPUT_HEADER)?,
-        text(SIGNATURE_HEADER)?,
-    ) {
+    // A host that describes the commit answered in the Nov 12 revision, and
+    // is held to it: a missing piece is named, not passed over for the Oct 29
+    // header.
+    if let Some(commit_header) = text(COMMIT_MAC_HEADER)? {
+        let missing = |name: &str| {
+            AppError::Auth(format!(
+                "the repo host sent an {COMMIT_MAC_HEADER} header without its {name} header"
+            ))
+        };
+        let signature_input =
+            text(SIGNATURE_INPUT_HEADER)?.ok_or_else(|| missing(SIGNATURE_INPUT_HEADER))?;
+        let signature = text(SIGNATURE_HEADER)?.ok_or_else(|| missing(SIGNATURE_HEADER))?;
         return verify_commit_signature(
             commit,
             space_uri,
@@ -815,61 +824,117 @@ mod tests {
         }
     }
 
+    /// The error `g2_verify` gives, which must exist.
+    fn g2_error(commit: &Commit, covered: &str, input: &str, sig: &str) -> String {
+        g2_verify(commit, covered, input, sig)
+            .expect_err("must be refused")
+            .to_string()
+    }
+
     #[test]
     fn a_commit_mac_is_refused_unless_it_is_this_requests() {
-        let refused = |params: &str, secret: &[u8; 32]| {
+        let refused = |params: &str, secret: &[u8; 32], why: &str| {
             let (input, sig) = g2_answer(&g2_covered(), "mac", params, secret);
-            g2_verify(&g2_commit(), &g2_covered(), &input, &sig).is_err()
+            let e = g2_error(&g2_commit(), &g2_covered(), &input, &sig);
+            assert!(e.contains(why), "{params}: expected {why:?}, got {e:?}");
         };
-        assert!(refused(G2_PARAMS, &[8; 32]), "another secret");
-        assert!(refused(G2_PARAMS, &[7; 32]), "the Oct 29 secret");
-        assert!(refused(
+        refused(G2_PARAMS, &[8; 32], "verification failed");
+        refused(G2_PARAMS, &[7; 32], "verification failed");
+        refused(
             r#"("atproto-space-commit";sf);keyid="did:key:zDnaOther";tag="atproto-space-commit""#,
-            &[9; 32]
-        ));
-        assert!(refused(
+            &[9; 32],
+            "names another key share",
+        );
+        refused(
             &format!(r#"{G2_PARAMS};alg="hmac-sha512""#),
-            &[9; 32]
-        ));
-        assert!(refused(
+            &[9; 32],
+            "algorithm must be hmac-sha256",
+        );
+        refused(
             r#"("atproto-space-commit");keyid="did:key:zDnaExample";tag="atproto-space-commit""#,
-            &[9; 32]
-        ));
-        assert!(refused(
+            &[9; 32],
+            "must cover exactly",
+        );
+        refused(
             r#"("atproto-space-commit";sf "authorization");tag="atproto-space-commit""#,
-            &[9; 32]
-        ));
-        assert!(refused(
+            &[9; 32],
+            "must cover exactly",
+        );
+        refused(
             r#"("atproto-space-record";sf);tag="atproto-space-record""#,
-            &[9; 32]
-        ));
+            &[9; 32],
+            "is missing",
+        );
 
         // Two signatures with the tag.
         let (input, sig) = g2_answer(&g2_covered(), "a", G2_PARAMS, &[9; 32]);
         let (input2, sig2) = g2_answer(&g2_covered(), "b", G2_PARAMS, &[9; 32]);
-        assert!(
-            g2_verify(
-                &g2_commit(),
-                &g2_covered(),
-                &format!("{input}, {input2}"),
-                &format!("{sig}, {sig2}")
-            )
-            .is_err()
+        let e = g2_error(
+            &g2_commit(),
+            &g2_covered(),
+            &format!("{input}, {input2}"),
+            &format!("{sig}, {sig2}"),
         );
+        assert!(e.contains("more than once"), "{e}");
 
         // A tampered header.
         let (input, sig) = g2_answer(&g2_covered(), "mac", G2_PARAMS, &[9; 32]);
         let mut later = g2_commit();
         later.rev = "3kbcq3p7ad401".into();
-        assert!(
-            g2_verify(
-                &later,
-                &g2_covered().replace("ad400", "ad401"),
-                &input,
-                &sig
-            )
-            .is_err()
+        let e = g2_error(
+            &later,
+            &g2_covered().replace("ad400", "ad401"),
+            &input,
+            &sig,
         );
+        assert!(e.contains("verification failed"), "{e}");
+
+        // The signature carries parameters, or isn't a byte sequence.
+        let mac = sig.strip_prefix("mac=").unwrap();
+        let e = g2_error(
+            &g2_commit(),
+            &g2_covered(),
+            &input,
+            &format!("mac={mac};x=1"),
+        );
+        assert!(e.contains("is missing its signature"), "{e}");
+        let e = g2_error(&g2_commit(), &g2_covered(), &input, r#"mac="text""#);
+        assert!(e.contains("is not a byte sequence"), "{e}");
+    }
+
+    #[derive(serde::Deserialize)]
+    struct FixedVector {
+        request: String,
+        commit: String,
+        signature_input: String,
+        signature: String,
+    }
+
+    /// Answers computed by the reference's own code and header library, not
+    /// by anything here.
+    #[test]
+    fn reference_commit_macs_verify() {
+        #[derive(serde::Deserialize)]
+        struct File {
+            vectors: Vec<FixedVector>,
+        }
+        let file: File = serde_json::from_str(include_str!(
+            "../../tests/fixtures/space_commit_mac_vectors.json"
+        ))
+        .unwrap();
+        assert_eq!(file.vectors.len(), 2);
+        assert_eq!(
+            accept_signature_header(KEY_SHARE).unwrap(),
+            file.vectors[0].request
+        );
+        for v in &file.vectors {
+            g2_verify(&g2_commit(), &v.commit, &v.signature_input, &v.signature)
+                .unwrap_or_else(|e| panic!("{}: {e}", v.request));
+            // The base here agrees with the reference's.
+            let label = v.signature_input.split_once('=').unwrap();
+            let (_, sig) = g2_answer(&v.commit, label.0, label.1, &[9; 32]);
+            assert_eq!(sig, v.signature);
+        }
     }
 
     #[test]
@@ -938,7 +1003,7 @@ mod tests {
         let c = g2_commit();
         let ex = g2_exchange();
         let g2 = header_map(&[
-            (COMMIT_MAC_PROFILE, &g2_covered()),
+            (COMMIT_MAC_HEADER, &g2_covered()),
             (SIGNATURE_INPUT_HEADER, &input),
             (SIGNATURE_HEADER, &sig),
         ]);
@@ -961,10 +1026,33 @@ mod tests {
 
         // Neither.
         assert!(verify_commit_response(&c, &c.space, &c.repo, &ex, &header_map(&[])).is_err());
+
+        // A Nov 12 answer missing a piece is named, not passed over for an
+        // Oct 29 header beside it.
+        let partial = header_map(&[
+            (COMMIT_MAC_HEADER, &g2_covered()),
+            (SIGNATURE_INPUT_HEADER, &input),
+            (MAC_HEADER, &g1),
+        ]);
+        let e = verify_commit_response(&c, &c.space, &c.repo, &ex, &partial)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("without its signature header"), "{e}");
+
+        // Fields split across lines are one field.
+        let (other_input, other_sig) = (r#"other=("content-digest");tag="other""#, "other=:AAAA:");
+        let split = header_map(&[
+            (COMMIT_MAC_HEADER, &g2_covered()),
+            (SIGNATURE_INPUT_HEADER, other_input),
+            (SIGNATURE_INPUT_HEADER, &input),
+            (SIGNATURE_HEADER, other_sig),
+            (SIGNATURE_HEADER, &sig),
+        ]);
+        verify_commit_response(&c, &c.space, &c.repo, &ex, &split).expect("split lines");
         // A Nov 12 answer that fails isn't rescued by an Oct 29 one beside it.
         let (bad_input, bad_sig) = g2_answer(&g2_covered(), "mac", G2_PARAMS, &[8; 32]);
         let both = header_map(&[
-            (COMMIT_MAC_PROFILE, &g2_covered()),
+            (COMMIT_MAC_HEADER, &g2_covered()),
             (SIGNATURE_INPUT_HEADER, &bad_input),
             (SIGNATURE_HEADER, &bad_sig),
             (MAC_HEADER, &g1),

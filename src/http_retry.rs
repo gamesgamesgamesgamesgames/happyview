@@ -214,6 +214,78 @@ mod tests {
         let _ = build_http_client("HappyView/test");
     }
 
+    /// A server answering each of `answers` in turn, one connection each,
+    /// keeping what each request carried.
+    async fn answering(
+        answers: Vec<&'static str>,
+    ) -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&received);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for answer in answers {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    sink.lock()
+                        .await
+                        .push(String::from_utf8_lossy(&buf[..n]).to_lowercase());
+                    let _ = sock.write_all(answer.as_bytes()).await;
+                }
+            }
+        });
+        (format!("http://{addr}/"), received)
+    }
+
+    #[tokio::test]
+    async fn headers_are_sent_on_every_request_and_the_last_answer_kept() {
+        let (url, received) = answering(vec![
+            "HTTP/1.1 401 Unauthorized\r\nx-answer: first\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nx-answer: a\r\nx-answer: b\r\nx-other: c\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        ])
+        .await;
+        let client = HappyViewHttpClient::default();
+        let send = || {
+            client.send_http(
+                atrium_xrpc::http::Request::get(url.clone())
+                    .body(Vec::new())
+                    .unwrap(),
+            )
+        };
+        // Two requests in one exchange, as a session's retry makes.
+        let (_, headers) = with_headers(
+            vec![
+                (
+                    HeaderName::from_static("x-one"),
+                    HeaderValue::from_static("1"),
+                ),
+                (
+                    HeaderName::from_static("x-two"),
+                    HeaderValue::from_static("2"),
+                ),
+            ],
+            async {
+                let _ = send().await;
+                send().await
+            },
+        )
+        .await;
+
+        let received = received.lock().await;
+        assert_eq!(received.len(), 2);
+        for request in received.iter() {
+            assert!(
+                request.contains("x-one: 1") && request.contains("x-two: 2"),
+                "{request}"
+            );
+        }
+        let answers: Vec<_> = headers.get_all("x-answer").iter().collect();
+        assert_eq!(answers, ["a", "b"], "the last response's, every line");
+        assert_eq!(headers.get("x-other").unwrap(), "c");
+    }
+
     #[tokio::test]
     async fn a_header_exchange_sends_one_header_and_reads_another_back() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

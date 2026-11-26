@@ -696,6 +696,68 @@ mod tests {
         assert_eq!(commit.rev(), "3krev");
     }
 
+    /// A 0016 commit, and the headers a Nov 12 host would answer it with.
+    fn nov12_commit(
+        exchange: &space_mac::Encapsulation,
+        data: [u8; 32],
+    ) -> (serde_json::Value, axum::http::HeaderMap) {
+        use base64::Engine;
+        use hmac::{KeyInit, Mac};
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let covered = format!(
+            r#"ver=1, repo="{AUTHOR}", space="{SPACE}", rev="3krev", data=:{}:"#,
+            b64(&data)
+        );
+        let params = format!(
+            r#"("atproto-space-commit";sf);keyid="{}";tag="atproto-space-commit""#,
+            exchange.key_share
+        );
+        let base =
+            format!("\"atproto-space-commit\";sf: {covered}\n\"@signature-params\": {params}");
+        let mut mac =
+            <hmac::Hmac<sha2::Sha256> as KeyInit>::new_from_slice(&exchange.export_secret).unwrap();
+        mac.update(base.as_bytes());
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in [
+            ("atproto-space-commit", covered),
+            ("signature-input", format!("mac={params}")),
+            (
+                "signature",
+                format!("mac=:{}:", b64(&mac.finalize().into_bytes())),
+            ),
+        ] {
+            headers.insert(name, axum::http::HeaderValue::from_str(&value).unwrap());
+        }
+        let json = serde_json::json!({
+            "ver": 1,
+            "repo": AUTHOR,
+            "space": SPACE,
+            "rev": "3krev",
+            "data": encode_lex_bytes(&data),
+        });
+        (json, headers)
+    }
+
+    #[test]
+    fn a_0016_commit_verifies_by_its_nov12_mac() {
+        let doc = did_doc(None, Some(&kem_key()));
+        let exchange = space_mac::encapsulate(&space_mac::author_kem_key(&doc).unwrap().unwrap());
+        let (json, headers) = nov12_commit(&exchange, [0xAA; 32]);
+        let commit = verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&exchange), &headers)
+            .expect("a Nov 12 MAC must verify");
+        assert!(matches!(commit, VerifiedCommit::Mac(_)));
+        assert_eq!(commit.hash(), &[0xAA; 32]);
+
+        // Under another exchange, or for another body, it doesn't.
+        let other = space_mac::encapsulate(&space_mac::author_kem_key(&doc).unwrap().unwrap());
+        assert!(verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&other), &headers).is_err());
+        let (tampered, _) = nov12_commit(&exchange, [0xAB; 32]);
+        assert!(
+            verify_remote_commit(&tampered, SPACE, AUTHOR, &doc, Some(&exchange), &headers)
+                .is_err()
+        );
+    }
+
     #[test]
     fn a_0016_commit_is_refused_without_a_mac_or_a_kem_key() {
         let doc = did_doc(None, Some(&kem_key()));
