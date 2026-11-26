@@ -639,7 +639,7 @@ mod tests {
             async move {
                 Ok(serde_json::json!({
                     "ops": [{ "rev": format!("3{n:012}"), "collection": "c.n", "rkey": "a", "cid": "bafya", "prev": null }],
-                    "cursor": if n % 2 == 0 { "x" } else { "y" },
+                    "cursor": if n.is_multiple_of(2) { "x" } else { "y" },
                 }))
             }
         })
