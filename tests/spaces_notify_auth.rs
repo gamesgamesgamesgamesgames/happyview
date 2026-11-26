@@ -1105,6 +1105,9 @@ enum ManagingAppAnswer {
     /// It refuses a space named in the `at:space/` form as malformed (400),
     /// and answers this to the `at://…/space/…` form.
     RefusesAtSpace(wiremock::ResponseTemplate),
+    /// It answers this to a space named in the `at:space/` form, and that to
+    /// the `at://…/space/…` form.
+    AnswersByForm(wiremock::ResponseTemplate, wiremock::ResponseTemplate),
 }
 
 /// A request naming its space in the `at:space/` form.
@@ -1184,6 +1187,20 @@ async fn through_managing_app(
                 .await;
             Mock::given(method("GET"))
                 .respond_with(response)
+                .with_priority(2)
+                .mount(&managing_app)
+                .await;
+            managing_app.uri()
+        }
+        ManagingAppAnswer::AnswersByForm(at_space, legacy) => {
+            Mock::given(method("GET"))
+                .and(NamesAtSpace)
+                .respond_with(at_space)
+                .with_priority(1)
+                .mount(&managing_app)
+                .await;
+            Mock::given(method("GET"))
+                .respond_with(legacy)
                 .with_priority(2)
                 .mount(&managing_app)
                 .await;
@@ -1893,4 +1910,55 @@ async fn check_access_names_the_space_as_at_space_then_as_before() {
         ],
         "the same method, in each form"
     );
+}
+
+/// An app written before `at:space/` may not recognise a space named in it,
+/// and deny it rather than refuse the request. It is asked once more in the
+/// `at://…/space/…` form, and admits as it always did.
+#[tokio::test]
+#[serial]
+async fn check_access_denied_as_at_space_is_asked_as_before() {
+    common::require_db!();
+    let decided = |read: bool| {
+        wiremock::ResponseTemplate::new(200).set_body_json(json!({ "read": read, "write": read }))
+    };
+    let (status, asked, body) = through_managing_app(
+        ManagingAppAnswer::AnswersByForm(decided(false), decided(true)),
+        Ask::NotifyWrite,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(asked.len(), 2, "{asked:?}");
+
+    // Denied in both forms is denied.
+    let (status, asked, body) = through_managing_app(
+        ManagingAppAnswer::AnswersByForm(decided(false), decided(false)),
+        Ask::NotifyWrite,
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(asked.len(), 2, "{asked:?}");
+
+    // Allowed in the at:space/ form is asked once.
+    let (status, asked, body) = through_managing_app(
+        ManagingAppAnswer::AnswersByForm(decided(true), decided(false)),
+        Ask::NotifyWrite,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(asked.len(), 1, "{asked:?}");
+
+    // A denial in the at:space/ form stands when the earlier form fails.
+    let (status, asked, body) = through_managing_app(
+        ManagingAppAnswer::AnswersByForm(decided(false), wiremock::ResponseTemplate::new(500)),
+        Ask::NotifyWrite,
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_ne!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "a denial, not a failure: {body}"
+    );
+    assert_eq!(asked.len(), 2, "{asked:?}");
 }

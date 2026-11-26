@@ -156,6 +156,9 @@ impl SpaceUri {
     pub fn to_form(&self, form: UriForm) -> String {
         match form {
             UriForm::Legacy => self.to_string(),
+            // `at:space/` names its space by DID only; a handle stays in the
+            // form that can carry it.
+            UriForm::AtSpace if !self.did.starts_with("did:") => self.to_string(),
             UriForm::AtSpace => {
                 let mut out = format!(
                     "{AT_SPACE_PREFIX}{}/{}/{}",
@@ -318,6 +321,11 @@ mod tests {
         ));
         assert!(is_space_reference(new) && is_space_reference(space));
         assert!(!is_space_reference("did:plc:abc123"));
+        // A handle can't be written in the at:space/ form.
+        let handle = "at://alice.example/space/com.example.forum/main";
+        if SpaceUri::parse(handle).is_ok() {
+            assert_eq!(UriForm::AtSpace.write(handle), handle);
+        }
     }
 
     #[test]

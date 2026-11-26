@@ -2608,7 +2608,8 @@ async fn notify_write(
                 &state,
                 &space.id,
                 notifications::RepoUpdate {
-                    space_uri: input.space.clone(),
+                    // Named as HappyView names the space in its own notices.
+                    space_uri: space_ref(&space),
                     repo: writer.clone(),
                     rev: rev.clone(),
                     hash,

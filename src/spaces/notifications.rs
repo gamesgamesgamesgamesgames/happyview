@@ -653,38 +653,35 @@ async fn deliver_revocations(
             )
             .await?;
             // The space named in the form the host takes; once more in the
-            // earlier form if it refuses `at:space/`.
-            let form =
-                crate::spaces::pds_support::space_uri_form(&state.db, state.db_backend, &endpoint)
-                    .await?;
-            let send = |form: crate::spaces::UriForm| {
-                state
-                    .http
-                    .post(&url)
-                    .bearer_auth(&token)
-                    .json(&serde_json::json!({ "space": form.write(&space_uri), "credentials": batch }))
-                    .send()
-            };
-            let mut result = send(form).await;
-            if form == crate::spaces::UriForm::AtSpace
-                && matches!(&result, Ok(resp) if resp.status() == reqwest::StatusCode::BAD_REQUEST)
-            {
-                result = send(crate::spaces::UriForm::Legacy).await;
-                if matches!(&result, Ok(resp) if resp.status().is_success()) {
-                    crate::spaces::pds_support::remember_legacy_space_uri(
-                        &state.db,
-                        state.db_backend,
-                        &endpoint,
-                    )
-                    .await?;
-                }
-            }
-            match result {
-                Ok(resp) if !resp.status().is_success() => {
-                    tracing::warn!(repo, status = %resp.status(), "repo host did not accept a revocation");
-                }
-                Err(e) => tracing::warn!(repo, error = %e, "could not deliver a revocation"),
-                Ok(_) => {}
+            // other form if it refuses that one as malformed.
+            let result = crate::spaces::pds_support::with_space_uri_form(
+                state,
+                Some(&endpoint),
+                &space_uri,
+                |space| {
+                    let request = state
+                        .http
+                        .post(&url)
+                        .bearer_auth(&token)
+                        .json(&serde_json::json!({ "space": space, "credentials": batch }));
+                    async move {
+                        let resp = request.send().await.map_err(|e| {
+                            AppError::Internal(format!("could not deliver a revocation: {e}"))
+                        })?;
+                        let status = resp.status();
+                        if status.is_success() {
+                            return Ok(());
+                        }
+                        let body = resp.text().await.unwrap_or_default();
+                        Err(AppError::Internal(format!(
+                            "repo host answered a revocation with {status}: {body}"
+                        )))
+                    }
+                },
+            )
+            .await;
+            if let Err(e) = result {
+                tracing::warn!(repo, error = %e, "repo host did not accept a revocation");
             }
         }
     }

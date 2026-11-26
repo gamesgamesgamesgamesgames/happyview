@@ -413,29 +413,45 @@ pub async fn get_support(
     Ok(fresh)
 }
 
+/// How long a host is remembered as taking only the `at://…/space/…` form.
+/// After that it is sent `at:space/` again, so a host that has since moved to
+/// the current form is found even if it never refuses the earlier one.
+const LEGACY_SPACE_URI_TTL: chrono::Duration = chrono::Duration::hours(24);
+
+/// A host's endpoint as the URI-form table keys it.
+fn host_key(pds: &str) -> &str {
+    pds.trim_end_matches('/')
+}
+
 /// The form `pds` takes space URIs in: `at:space/` unless it has refused
-/// that form before.
+/// that form within [`LEGACY_SPACE_URI_TTL`].
 pub async fn space_uri_form(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     pds: &str,
 ) -> Result<crate::spaces::UriForm, AppError> {
     let row: Option<(String,)> = crate::db::query_as(&adapt_sql(
-        "SELECT pds_endpoint FROM happyview_space_host_uri_forms WHERE pds_endpoint = ?",
+        "SELECT recorded_at FROM happyview_space_host_uri_forms WHERE pds_endpoint = ?",
         backend,
     ))
-    .bind(pds)
+    .bind(host_key(pds))
     .fetch_optional(pool)
     .await
     .map_err(|e| AppError::Internal(format!("failed to read a host's URI form: {e}")))?;
-    Ok(if row.is_some() {
+    let recent = row.is_some_and(|(recorded_at,)| {
+        chrono::DateTime::parse_from_rfc3339(&recorded_at).is_ok_and(|t| {
+            chrono::Utc::now() - t.with_timezone(&chrono::Utc) < LEGACY_SPACE_URI_TTL
+        })
+    });
+    Ok(if recent {
         crate::spaces::UriForm::Legacy
     } else {
         crate::spaces::UriForm::AtSpace
     })
 }
 
-/// Remember that `pds` takes space URIs in the `at://…/space/…` form only.
+/// Remember that `pds` takes space URIs in the `at://…/space/…` form only,
+/// from now.
 pub async fn remember_legacy_space_uri(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -443,15 +459,49 @@ pub async fn remember_legacy_space_uri(
 ) -> Result<(), AppError> {
     crate::db::query(&adapt_sql(
         "INSERT INTO happyview_space_host_uri_forms (pds_endpoint, recorded_at) VALUES (?, ?) \
-         ON CONFLICT (pds_endpoint) DO NOTHING",
+         ON CONFLICT (pds_endpoint) DO UPDATE SET recorded_at = excluded.recorded_at",
         backend,
     ))
-    .bind(pds)
+    .bind(host_key(pds))
     .bind(crate::db::now_rfc3339())
     .execute(pool)
     .await
     .map_err(|e| AppError::Internal(format!("failed to record a host's URI form: {e}")))?;
     Ok(())
+}
+
+/// Forget that `pds` takes only the earlier form: it has taken `at:space/`.
+pub async fn forget_legacy_space_uri(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    pds: &str,
+) -> Result<(), AppError> {
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_host_uri_forms WHERE pds_endpoint = ?",
+        backend,
+    ))
+    .bind(host_key(pds))
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to forget a host's URI form: {e}")))?;
+    Ok(())
+}
+
+/// Record the form a host just took a space URI in, when it isn't the one it
+/// was first sent.
+async fn record_space_uri_form(
+    state: &AppState,
+    pds: &str,
+    took: crate::spaces::UriForm,
+) -> Result<(), AppError> {
+    match took {
+        crate::spaces::UriForm::Legacy => {
+            remember_legacy_space_uri(&state.db, state.db_backend, pds).await
+        }
+        crate::spaces::UriForm::AtSpace => {
+            forget_legacy_space_uri(&state.db, state.db_backend, pds).await
+        }
+    }
 }
 
 /// Whether a host's refusal is of the space URI's form. A host that predates
@@ -460,14 +510,27 @@ pub async fn remember_legacy_space_uri(
 /// change) `InvalidSpaceUri`.
 pub fn refuses_space_uri_form(err: &AppError) -> bool {
     let text = err.to_string().to_ascii_lowercase();
-    text.contains("invalidspaceuri") || (text.contains("invalidrequest") && text.contains("space"))
+    // What names the `space` parameter's value, as lexicon validation and the
+    // hosts word it, rather than any mention of a space (a method's NSID
+    // has one).
+    const NAMES_THE_SPACE: [&str; 6] = [
+        "space-ref",
+        "space uri",
+        "space ref",
+        "input/space",
+        "params/space",
+        ": space",
+    ];
+    text.contains("invalidspaceuri")
+        || (text.contains("invalidrequest") && NAMES_THE_SPACE.iter().any(|p| text.contains(p)))
 }
 
-/// Call a PDS with a space URI in the form it takes. A host not known to
-/// take only the earlier form is sent `at:space/`; if it refuses that as
-/// malformed, it is asked once more in the earlier form, which is remembered.
-/// `pds` is the host's endpoint, or `None` when it isn't known (then
-/// `at:space/` is tried first all the same, and nothing is remembered).
+/// Call a PDS with a space URI in the form it takes. A host is sent the form
+/// it last took (`at:space/` unless it was remembered as taking only the
+/// earlier form); if it refuses that as malformed, it is asked once more in the
+/// other form, and the form it takes is remembered. `pds` is the host's
+/// endpoint, or `None` when it isn't known (then `at:space/` is tried first
+/// all the same, and nothing is remembered).
 pub async fn with_space_uri_form<T, F, Fut>(
     state: &AppState,
     pds: Option<&str>,
@@ -484,12 +547,16 @@ where
         None => UriForm::AtSpace,
     };
     match call(form.write(space_uri)).await {
-        Err(err) if form == UriForm::AtSpace && refuses_space_uri_form(&err) => {
-            let answer = call(UriForm::Legacy.write(space_uri)).await;
+        Err(err) if refuses_space_uri_form(&err) => {
+            let other = match form {
+                UriForm::AtSpace => UriForm::Legacy,
+                UriForm::Legacy => UriForm::AtSpace,
+            };
+            let answer = call(other.write(space_uri)).await;
             if answer.is_ok()
                 && let Some(pds) = pds
             {
-                remember_legacy_space_uri(&state.db, state.db_backend, pds).await?;
+                record_space_uri_form(state, pds, other).await?;
             }
             answer
         }
@@ -1013,10 +1080,17 @@ mod tests {
             assert!(result.is_ok());
             assert_eq!(sent, [SPACE]);
 
-            // A refusal in the earlier form isn't asked again.
+            // Refused in the earlier form too, it is asked in `at:space/`
+            // once, and stays remembered when that is refused as well.
             let (result, sent) = sent_to(&state, Some(PDS), |_| Err(refusal())).await;
             assert!(result.is_err());
-            assert_eq!(sent, [SPACE]);
+            assert_eq!(sent, [SPACE, NEW]);
+            assert_eq!(
+                space_uri_form(&state.db, state.db_backend, PDS)
+                    .await
+                    .unwrap(),
+                UriForm::Legacy
+            );
         }
 
         #[tokio::test]
@@ -1054,6 +1128,92 @@ mod tests {
             assert_eq!(sent, [NEW, SPACE]);
         }
 
+        #[tokio::test]
+        async fn a_remembered_host_that_moves_to_at_space_is_found_again() {
+            let state = crate::test_support::test_state_with_pool(
+                crate::test_support::migrated_memory_pool().await,
+            );
+            remember_legacy_space_uri(&state.db, state.db_backend, PDS)
+                .await
+                .unwrap();
+            // The host has moved to the hard cut and refuses the earlier form.
+            let current_only = |space: &str| {
+                if space.starts_with("at:space/") {
+                    Ok(())
+                } else {
+                    Err(AppError::Internal(
+                        r#"PDS request failed: xrpc response error: 400 {"error":"InvalidRequest","message":"Invalid space-ref format: space"}"#.into(),
+                    ))
+                }
+            };
+            let (result, sent) = sent_to(&state, Some(PDS), current_only).await;
+            assert!(result.is_ok());
+            assert_eq!(sent, [SPACE, NEW]);
+            assert_eq!(
+                space_uri_form(&state.db, state.db_backend, PDS)
+                    .await
+                    .unwrap(),
+                UriForm::AtSpace,
+                "forgotten"
+            );
+            let (_, sent) = sent_to(&state, Some(PDS), current_only).await;
+            assert_eq!(sent, [NEW]);
+        }
+
+        #[tokio::test]
+        async fn a_remembered_host_is_sent_at_space_again_after_a_day() {
+            let state = crate::test_support::test_state_with_pool(
+                crate::test_support::migrated_memory_pool().await,
+            );
+            crate::db::query(&adapt_sql(
+                "INSERT INTO happyview_space_host_uri_forms (pds_endpoint, recorded_at) VALUES (?, ?)",
+                state.db_backend,
+            ))
+            .bind(PDS)
+            .bind((chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339())
+            .execute(&state.db)
+            .await
+            .unwrap();
+            assert_eq!(
+                space_uri_form(&state.db, state.db_backend, PDS)
+                    .await
+                    .unwrap(),
+                UriForm::AtSpace
+            );
+            // Refusing again renews the entry.
+            let earlier_only = |space: &str| {
+                if space.starts_with("at:space/") {
+                    Err(refusal())
+                } else {
+                    Ok(())
+                }
+            };
+            let (_, sent) = sent_to(&state, Some(PDS), earlier_only).await;
+            assert_eq!(sent, [NEW, SPACE]);
+            assert_eq!(
+                space_uri_form(&state.db, state.db_backend, PDS)
+                    .await
+                    .unwrap(),
+                UriForm::Legacy
+            );
+        }
+
+        #[tokio::test]
+        async fn a_host_is_the_same_host_with_a_trailing_slash() {
+            let state = crate::test_support::test_state_with_pool(
+                crate::test_support::migrated_memory_pool().await,
+            );
+            remember_legacy_space_uri(&state.db, state.db_backend, &format!("{PDS}/"))
+                .await
+                .unwrap();
+            assert_eq!(
+                space_uri_form(&state.db, state.db_backend, PDS)
+                    .await
+                    .unwrap(),
+                UriForm::Legacy
+            );
+        }
+
         #[test]
         fn refusals_of_the_form_are_recognised() {
             assert!(refuses_space_uri_form(&refusal()));
@@ -1066,6 +1226,13 @@ mod tests {
             )));
             assert!(!refuses_space_uri_form(&AppError::Internal(
                 "PDS query failed: SpaceNotFound".into()
+            )));
+            // A method's NSID names a space, but not the space parameter.
+            assert!(!refuses_space_uri_form(&AppError::BadGateway(
+                r#"the user's PDS rejected com.atproto.space.applyWrites: {"error":"InvalidRequest","message":"missing collection"}"#.into()
+            )));
+            assert!(refuses_space_uri_form(&AppError::BadGateway(
+                r#"the user's PDS rejected com.atproto.space.applyWrites: {"error":"InvalidRequest","message":"Input/space must be a valid space-ref"}"#.into()
             )));
         }
     }

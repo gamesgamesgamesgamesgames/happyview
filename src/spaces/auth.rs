@@ -407,8 +407,9 @@ async fn check_user_access_with_managing_app(
     for method in &CheckMethod::NEWEST_FIRST {
         // `checkAccess` names the space as `at:space/`, as Proposal 0016 has
         // since Nov 24, 2026, and once more as `at://…/space/…` if the app
-        // refuses that request as malformed. The older methods predate
-        // `at:space/`.
+        // refuses that request as malformed or denies it: an app written
+        // before the change may not recognise the space in the new form. The
+        // older methods predate `at:space/`.
         let forms: &[crate::spaces::UriForm] = match method {
             CheckMethod::Nov12 => &[
                 crate::spaces::UriForm::AtSpace,
@@ -438,8 +439,17 @@ async fn check_user_access_with_managing_app(
                 {
                     continue;
                 }
+                // The earlier form was refused or denied; this form's failure
+                // leaves that answer standing.
+                Err(_) if answer.is_some() => break,
                 other => {
-                    answer = Some(other?);
+                    let this = other?;
+                    let denied = matches!(&this, Answer::Decided(a)
+                        if method.decision(a, access) == Some(false));
+                    answer = Some(this);
+                    if denied && i + 1 < forms.len() {
+                        continue;
+                    }
                     break;
                 }
             }
