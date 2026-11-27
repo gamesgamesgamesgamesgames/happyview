@@ -148,7 +148,7 @@ pub(crate) async fn apply_in(state: &AppState, event: SourceEvent) -> Applied {
             rev,
             as_of_us,
             seq: _,
-            time_us: _,
+            time_us,
             collections,
         } => {
             let tracked = match collections {
@@ -158,16 +158,26 @@ pub(crate) async fn apply_in(state: &AppState, event: SourceEvent) -> Applied {
             // A replayed sync acts as of its own rev, or its own time when
             // it carries none (P2).
             let before = as_of_us.map(|t| rev.clone().unwrap_or_else(|| tid(t)));
-            crate::db::with_change_reason(
+            let applied = crate::db::with_change_reason(
                 Some("purge:sync".to_string()),
                 repo_resynced(state, &did, rev.as_deref(), &tracked, before.as_deref()),
             )
-            .await
+            .await;
+            // After the resync purge, so a `repo:sync` script sees the repo
+            // as HappyView now holds it.
+            crate::repo_events::sync(state, &did, rev.as_deref(), as_of_us, time_us).await;
+            applied
         }
-        SourceEvent::Identity { did, handle } => {
+        SourceEvent::Identity {
+            did,
+            handle,
+            as_of_us,
+            time_us,
+        } => {
             // HappyView caches no DID documents or handles, so there is
-            // nothing to refresh.
+            // nothing to refresh; an `identity:update` script hears of it.
             tracing::debug!(did, ?handle, "jetstream identity event");
+            crate::repo_events::identity(state, &did, handle.as_deref(), as_of_us, time_us).await;
             Applied::ok(IngestOutcome::Skipped)
         }
     }
@@ -1357,6 +1367,9 @@ async fn account_event(
     time_us: Option<i64>,
     collections: Option<&[String]>,
 ) -> Applied {
+    // Before HappyView acts on it, so an `account:delete` script runs while
+    // the account's records are still held.
+    crate::repo_events::account(state, did, active, status, as_of_us, time_us).await;
     let before = as_of_us.map(tid);
     // The DID tombstone's rev: when the source saw the event.
     let witnessed = time_us

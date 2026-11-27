@@ -178,6 +178,7 @@ export default function ScriptDetail() {
     xrpc: "XRPC handler",
     labeler: "Label arrival",
     job: "Job runner",
+    account: "Account event",
   };
 
   if (script?.module) {

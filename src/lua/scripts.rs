@@ -75,6 +75,25 @@ pub enum TriggerKind {
     XrpcProcedure,
     LabelerApply,
     JobRun,
+    /// `identity:<event>`: an `#identity` event for an indexed repo.
+    Identity,
+    /// `account:<event>`: an `#account` event for an indexed repo.
+    Account,
+    /// `repo:<event>`: a `#sync` event for an indexed repo.
+    Repo,
+}
+
+/// The suffixes each repo-event kind takes, which are the events it fires on.
+pub const IDENTITY_EVENTS: &[&str] = &["update"];
+pub const ACCOUNT_EVENTS: &[&str] = &["update", "activate", "deactivate", "suspend", "delete"];
+pub const REPO_EVENTS: &[&str] = &["sync"];
+
+impl TriggerKind {
+    /// Whether this kind fires on an identity, account or sync event rather
+    /// than on a record, a label, a request or a job.
+    pub fn is_repo_event(self) -> bool {
+        matches!(self, Self::Identity | Self::Account | Self::Repo)
+    }
 }
 
 /// A trigger id parsed into `(kind, suffix)`. The suffix is either an NSID
@@ -110,6 +129,9 @@ impl ParsedTrigger {
             TriggerKind::XrpcProcedure => format!("xrpc.procedure:{}", self.suffix),
             TriggerKind::LabelerApply => format!("labeler.apply:{}", self.suffix),
             TriggerKind::JobRun => format!("job.run:{}", self.suffix),
+            TriggerKind::Identity => format!("identity:{}", self.suffix),
+            TriggerKind::Account => format!("account:{}", self.suffix),
+            TriggerKind::Repo => format!("repo:{}", self.suffix),
         }
     }
 
@@ -121,7 +143,8 @@ impl ParsedTrigger {
                 "trigger id '{id}' must contain a ':' separator; \
                  valid prefixes: record.{{index,create,update,delete}}:<nsid>, \
                  xrpc.{{query,procedure}}:<nsid>, labeler.apply:<nsid|_actor>, \
-                 job.run:<type>"
+                 job.run:<type>, identity:update, \
+                 account:{{update,activate,deactivate,suspend,delete}}, repo:sync"
             )
         })?;
 
@@ -138,11 +161,14 @@ impl ParsedTrigger {
             "xrpc.procedure" => TriggerKind::XrpcProcedure,
             "labeler.apply" => TriggerKind::LabelerApply,
             "job.run" => TriggerKind::JobRun,
+            "identity" => TriggerKind::Identity,
+            "account" => TriggerKind::Account,
+            "repo" => TriggerKind::Repo,
             other => {
                 return Err(format!(
                     "unknown trigger prefix '{other}'; valid prefixes: \
                      record.{{index,create,update,delete}}, xrpc.{{query,procedure}}, \
-                     labeler.apply, job.run"
+                     labeler.apply, job.run, identity, account, repo"
                 ));
             }
         };
@@ -164,6 +190,19 @@ impl ParsedTrigger {
                 }
             }
             TriggerKind::LabelerApply if suffix == "_actor" => {}
+            TriggerKind::Identity | TriggerKind::Account | TriggerKind::Repo => {
+                let events = match kind {
+                    TriggerKind::Identity => IDENTITY_EVENTS,
+                    TriggerKind::Account => ACCOUNT_EVENTS,
+                    _ => REPO_EVENTS,
+                };
+                if !events.contains(&suffix) {
+                    return Err(format!(
+                        "unknown {prefix} event '{suffix}'; valid events: {}",
+                        events.join(", ")
+                    ));
+                }
+            }
             _ => happyview_nsid::validate_nsid(suffix).map_err(|e| e.to_string())?,
         }
 
@@ -444,6 +483,147 @@ pub async fn run_record_event_once(
             ScriptValueKind::Object => RecordHookOutcome::Replace(value),
             ScriptValueKind::Other => RecordHookOutcome::Proceed,
         }),
+        ScriptExecuteOutput::Error {
+            kind, raw, chunk, ..
+        } => Err(failure_text(
+            kind,
+            crate::error::file_of(chunk).as_deref(),
+            &raw,
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Repo-event dispatcher: identity, account and sync events
+// ---------------------------------------------------------------------------
+
+/// The `host_kind` a failed identity, account or sync script is
+/// dead-lettered under.
+pub const REPO_EVENT_HOST_KIND: &str = "repo_event";
+
+/// Whether any script is bound to `trigger`. Cheap: it reads the catalog in
+/// memory, so ingest asks it before anything that touches the database.
+pub async fn has_repo_event_script(state: &AppState, trigger: &ParsedTrigger) -> bool {
+    let project = state.project.load_full();
+    state.scripts.resolve_in(&project, trigger).await.is_some()
+}
+
+/// Run the script bound to `trigger` (`identity:*`, `account:*` or
+/// `repo:*`), if any, with `input`, as the account `did`. Retried and
+/// dead-lettered as record scripts are; what it returns is ignored.
+pub async fn run_repo_event_script(
+    state: &AppState,
+    trigger: &ParsedTrigger,
+    did: &str,
+    input: &Value,
+) {
+    let project = state.project.load_full();
+    let Some(resolved) = state.scripts.resolve_in(&project, trigger).await else {
+        return;
+    };
+    let entry = |error: &str, attempts: u32| {
+        let error = error.to_string();
+        let resolved = &resolved;
+        async move {
+            dead_letter(
+                state,
+                &DeadLetterEntry {
+                    script: resolved,
+                    host_kind: REPO_EVENT_HOST_KIND,
+                    host_id: did,
+                    payload: input,
+                    error: &error,
+                    attempts,
+                    collection: None,
+                },
+                did,
+            )
+            .await;
+        }
+    };
+    if no_interpreter_for(state, &resolved).await {
+        entry(
+            &crate::script::no_interpreter_message(&resolved.script_type),
+            1,
+        )
+        .await;
+        return;
+    }
+    let mut last_error = String::new();
+    for attempt in 0..attempts(state) {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(1 << (attempt - 1))).await;
+        }
+        match run_repo_event_once(state, &resolved, did, input).await {
+            Ok(()) => {
+                if state.verbose_event_logging.load(Ordering::Relaxed) {
+                    log_event(
+                        &state.db,
+                        EventLog {
+                            event_type: "script.executed".to_string(),
+                            severity: Severity::Info,
+                            actor_did: None,
+                            subject: Some(did.to_string()),
+                            detail: serde_json::json!({
+                                "host_kind": REPO_EVENT_HOST_KIND,
+                                "host_id": did,
+                                "trigger": resolved.id,
+                                "attempts": attempt + 1,
+                            }),
+                        },
+                        state.db_backend,
+                    )
+                    .await;
+                }
+                return;
+            }
+            Err(e) => {
+                last_error = e;
+                tracing::warn!(
+                    did,
+                    trigger = %resolved.id,
+                    attempt = attempt + 1,
+                    "repo-event script attempt failed: {last_error}"
+                );
+            }
+        }
+    }
+    entry(&last_error, attempts(state)).await;
+}
+
+/// One run of a repo-event script, which the retry loop and the admin
+/// retry endpoint share. The script's return value is ignored.
+pub async fn run_repo_event_once(
+    state: &AppState,
+    script: &ResolvedScript,
+    did: &str,
+    input: &Value,
+) -> Result<(), String> {
+    let trigger = trigger_of(script, None)?;
+    let outcome = dispatch(
+        state,
+        &Invocation {
+            trigger_id: &script.id,
+            trigger,
+            language: &script.script_type,
+            source: &script.body,
+            input,
+            // The account the event is about; the event carries none of its
+            // credentials.
+            caller_did: Some(did),
+            has_pds_auth: false,
+            method: None,
+            collection: None,
+            params: None,
+            delegate_did: None,
+            space: None,
+            origin: ScriptOrigin::of(script),
+        },
+        None,
+    )
+    .await;
+    match outcome.map_err(|e| e.to_string())? {
+        ScriptExecuteOutput::Returned { .. } => Ok(()),
         ScriptExecuteOutput::Error {
             kind, raw, chunk, ..
         } => Err(failure_text(
@@ -791,6 +971,35 @@ async fn write_dead_letter(state: &AppState, entry: &DeadLetterEntry<'_>) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn identity_account_and_repo_triggers_parse_by_their_events() {
+        for (id, kind) in [
+            ("identity:update", TriggerKind::Identity),
+            ("account:update", TriggerKind::Account),
+            ("account:activate", TriggerKind::Account),
+            ("account:deactivate", TriggerKind::Account),
+            ("account:suspend", TriggerKind::Account),
+            ("account:delete", TriggerKind::Account),
+            ("repo:sync", TriggerKind::Repo),
+        ] {
+            let t = ParsedTrigger::parse(id).unwrap_or_else(|e| panic!("{id}: {e}"));
+            assert_eq!(t.kind, kind);
+            assert_eq!(t.id(), id);
+            assert!(t.kind.is_repo_event());
+        }
+        for id in [
+            "identity:create",
+            "account:create",
+            "account:",
+            "repo:update",
+            "account:com.example.x",
+        ] {
+            assert!(ParsedTrigger::parse(id).is_err(), "{id}");
+        }
+        assert!(!TriggerKind::RecordCreate.is_repo_event());
+    }
+
     #[test]
     fn a_failure_text_leads_with_its_file() {
         assert_eq!(
