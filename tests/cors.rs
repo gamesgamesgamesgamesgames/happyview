@@ -149,3 +149,24 @@ async fn request_without_origin_gets_no_cors_headers() {
     assert_eq!(header(&resp, "access-control-allow-origin"), None);
     assert_eq!(header(&resp, "access-control-allow-credentials"), None);
 }
+
+#[tokio::test]
+#[serial]
+async fn preflight_allows_the_admin_api_update_methods() {
+    common::require_db!();
+    let app = common::app::TestApp::new().await;
+
+    for method in ["PUT", "PATCH"] {
+        let resp = app
+            .router
+            .clone()
+            .oneshot(preflight(TRUSTED_ORIGIN, method))
+            .await
+            .unwrap();
+        let allowed = header(&resp, "access-control-allow-methods").unwrap_or_default();
+        assert!(
+            allowed.split(", ").any(|m| m == method),
+            "a browser client must be able to send {method} to the admin API, got {allowed:?}"
+        );
+    }
+}
