@@ -136,6 +136,10 @@ struct DeadLetterRow {
     rkey: String,
     action: String,
     record: Option<String>,
+    /// The trigger id the row was written for, and the input the script
+    /// was given. Only scripts-table rows carry them.
+    script_ref: String,
+    payload: Value,
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +554,14 @@ fn summary_from_scripts_row(row: &ScriptsDeadLetterRow) -> DeadLetterSummary {
     };
 
     let (lexicon_id, collection, did, rkey, action) = match host_kind.as_str() {
+        // An identity, account or sync script: the trigger names the event.
+        crate::lua::scripts::REPO_EVENT_HOST_KIND => (
+            String::new(),
+            String::new(),
+            host_id.clone(),
+            String::new(),
+            script_ref.clone(),
+        ),
         "label" => {
             let collection_from_trigger = script_ref
                 .split_once(':')
@@ -734,17 +746,19 @@ async fn fetch_dead_letter_for_action(
                 rkey: row.5,
                 action: row.6,
                 record: row.7,
+                script_ref: String::new(),
+                payload: Value::Null,
             })
         }
         DeadLetterSource::Scripts => {
             let backend = state.db_backend;
             let id_int: i64 = id.parse().unwrap_or_default();
             let sql = adapt_sql(
-                "SELECT id, host_kind, payload FROM happyview_dead_letter_scripts
+                "SELECT id, host_kind, payload, script_ref FROM happyview_dead_letter_scripts
                  WHERE id = ? AND resolved_at IS NULL",
                 backend,
             );
-            let row: (i64, String, String) = crate::db::query_as(&sql)
+            let row: (i64, String, String, String) = crate::db::query_as(&sql)
                 .bind(id_int)
                 .fetch_optional(&state.db)
                 .await
@@ -776,6 +790,8 @@ async fn fetch_dead_letter_for_action(
                 rkey: s("rkey"),
                 action: s("action"),
                 record,
+                script_ref: row.3.clone(),
+                payload: payload_v.clone(),
             })
         }
     }
@@ -902,6 +918,10 @@ async fn retry_single(state: &AppState, id: &str) -> Result<(), AppError> {
         ));
     }
 
+    if dl.host_kind == crate::lua::scripts::REPO_EVENT_HOST_KIND {
+        return retry_repo_event(state, &dl).await;
+    }
+
     let project = state.project.load_full();
     let resolved = state
         .scripts
@@ -970,6 +990,30 @@ async fn retry_single(state: &AppState, id: &str) -> Result<(), AppError> {
     }
 }
 
+/// Run an identity, account or sync script again with the input it failed
+/// on, for the account it was about.
+async fn retry_repo_event(state: &AppState, dl: &DeadLetterRow) -> Result<(), AppError> {
+    let trigger = crate::lua::scripts::ParsedTrigger::parse(&dl.script_ref).map_err(|e| {
+        AppError::BadRequest(format!("dead letter {} names no trigger: {e}", dl.id))
+    })?;
+    let project = state.project.load_full();
+    let resolved = state
+        .scripts
+        .resolve_in(&project, &trigger)
+        .await
+        .ok_or_else(|| AppError::NotFound(format!("no script bound for {}", dl.script_ref)))?;
+    match crate::lua::scripts::run_repo_event_once(state, &resolved, &dl.payload).await {
+        Ok(()) => mark_resolved(state, &dl.id, dl.source).await,
+        Err(e) => {
+            update_error(state, &dl.id, dl.source, &e).await?;
+            Err(AppError::Internal(format!(
+                "retry failed for dead letter {}: {e}",
+                dl.id
+            )))
+        }
+    }
+}
+
 /// Reindex by fetching the record fresh from the PDS. Only applies to
 /// record-event dead letters.
 async fn reindex_single(state: &AppState, id: &str) -> Result<(), AppError> {
@@ -980,6 +1024,11 @@ async fn reindex_single(state: &AppState, id: &str) -> Result<(), AppError> {
             "label-arrival dead letters can't be reindexed — they don't have \
              a record to fetch."
                 .into(),
+        ));
+    }
+    if dl.host_kind == crate::lua::scripts::REPO_EVENT_HOST_KIND {
+        return Err(AppError::BadRequest(
+            "identity, account and sync dead letters have no record to fetch; retry instead".into(),
         ));
     }
 

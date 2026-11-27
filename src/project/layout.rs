@@ -189,6 +189,9 @@ pub fn classify(
         "lexicons" if nested => beside_lexicons(file, base, extension, claim, claims, lexicons),
         "jobs" if nested => flat(file, Flat::Jobs, base, extension, claim, claims),
         "labels" if nested => flat(file, Flat::Labels, base, extension, claim, claims),
+        dir @ ("identity" | "account" | "repo") if nested => {
+            repo_event(file, dir, base, extension, claim, claims)
+        }
         _ => Ok(module_or_ignored(claim)),
     }
 }
@@ -226,6 +229,36 @@ fn flat(
     }
     let claim = require_claim(file, extension, claim, claims)?;
     let trigger = ParsedTrigger::parse(&format!("{prefix}:{base}"))
+        .map_err(|e| Diagnostic::error(file.rel_path(), e))?;
+    Ok(Role::Handler { trigger, claim })
+}
+
+/// `src/identity/`, `src/account/` and `src/repo/` hold a handler per event,
+/// named by the event (`src/account/delete.lua` is `account:delete`). A file
+/// named after no event of its kind is a module, as files in these
+/// directories were before they named handlers.
+fn repo_event(
+    file: &SrcFile,
+    dir: &str,
+    base: &str,
+    extension: &str,
+    claim: Option<Claim>,
+    claims: &ExtensionClaims,
+) -> Result<Role, Diagnostic> {
+    use crate::lua::scripts::{ACCOUNT_EVENTS, IDENTITY_EVENTS, REPO_EVENTS};
+    let events = match dir {
+        "identity" => IDENTITY_EVENTS,
+        "account" => ACCOUNT_EVENTS,
+        _ => REPO_EVENTS,
+    };
+    if file.segments.len() > 2 || !events.contains(&base) {
+        return Ok(module_or_ignored(claim));
+    }
+    if claim.is_none() && is_document(extension) {
+        return Ok(Role::Ignored);
+    }
+    let claim = require_claim(file, extension, claim, claims)?;
+    let trigger = ParsedTrigger::parse(&format!("{dir}:{base}"))
         .map_err(|e| Diagnostic::error(file.rel_path(), e))?;
     Ok(Role::Handler { trigger, claim })
 }
@@ -386,6 +419,29 @@ mod tests {
             Ok(Role::Handler { trigger, .. }) => trigger.id(),
             other => panic!("{path}: expected a handler, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn identity_account_and_repo_handlers_are_named_by_their_event() {
+        assert_eq!(trigger("identity/update.lua"), "identity:update");
+        for event in ["update", "activate", "deactivate", "suspend", "delete"] {
+            assert_eq!(
+                trigger(&format!("account/{event}.lua")),
+                format!("account:{event}")
+            );
+        }
+        assert_eq!(trigger("repo/sync.lua"), "repo:sync");
+        // A file named after no event stays a module, as it was before
+        // these directories named handlers.
+        assert!(matches!(
+            role("account/helpers.lua"),
+            Ok(Role::Module { .. })
+        ));
+        assert!(matches!(role("repo/create.lua"), Ok(Role::Module { .. })));
+        assert!(matches!(
+            role("account/sub/delete.lua"),
+            Ok(Role::Module { .. })
+        ));
     }
 
     fn error(path: &str) -> String {

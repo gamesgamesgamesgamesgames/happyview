@@ -175,7 +175,10 @@ export type TriggerKind =
   | "xrpc.query"
   | "xrpc.procedure"
   | "labeler.apply"
-  | "job.run";
+  | "job.run"
+  | "identity"
+  | "account"
+  | "repo";
 
 /** Display labels for each trigger kind. */
 export const TRIGGER_KIND_LABELS: Record<TriggerKind, string> = {
@@ -187,16 +190,20 @@ export const TRIGGER_KIND_LABELS: Record<TriggerKind, string> = {
   "xrpc.procedure": "XRPC procedure",
   "labeler.apply": "Label arrival",
   "job.run": "Job runner",
+  identity: "Identity event",
+  account: "Account event",
+  repo: "Repo sync",
 };
 
 /** Top-level grouping for the Scripts list page. */
-export type TriggerFamily = "record" | "xrpc" | "labeler" | "job";
+export type TriggerFamily = "record" | "xrpc" | "labeler" | "job" | "account";
 
 export const TRIGGER_FAMILY_LABELS: Record<TriggerFamily, string> = {
   record: "Record events",
   xrpc: "XRPC handlers",
   labeler: "Label arrivals",
   job: "Job runners",
+  account: "Identity and account events",
 };
 
 /** Map a trigger kind to its top-level family. */
@@ -204,6 +211,8 @@ export function familyOf(kind: TriggerKind): TriggerFamily {
   if (kind.startsWith("record.")) return "record";
   if (kind.startsWith("xrpc.")) return "xrpc";
   if (kind.startsWith("job.")) return "job";
+  if (kind === "identity" || kind === "account" || kind === "repo")
+    return "account";
   return "labeler";
 }
 
@@ -229,6 +238,9 @@ export function parseTriggerId(
       "xrpc.procedure",
       "labeler.apply",
       "job.run",
+      "identity",
+      "account",
+      "repo",
     ] as const
   ).find((k) => k === prefix);
   if (!kind) return null;

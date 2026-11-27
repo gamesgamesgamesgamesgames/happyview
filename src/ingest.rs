@@ -131,7 +131,9 @@ pub(crate) async fn apply_in(state: &AppState, event: SourceEvent) -> Applied {
             time_us,
             collections,
         } => {
-            account_event(
+            // Boxed: an account event's purge and scripts make a large
+            // future, and `apply_in` runs on every event.
+            Box::pin(account_event(
                 state,
                 &did,
                 active,
@@ -140,15 +142,15 @@ pub(crate) async fn apply_in(state: &AppState, event: SourceEvent) -> Applied {
                 seq,
                 time_us,
                 collections.as_deref(),
-            )
+            ))
             .await
         }
         SourceEvent::Sync {
             did,
             rev,
             as_of_us,
-            seq: _,
-            time_us: _,
+            seq,
+            time_us,
             collections,
         } => {
             let tracked = match collections {
@@ -158,16 +160,52 @@ pub(crate) async fn apply_in(state: &AppState, event: SourceEvent) -> Applied {
             // A replayed sync acts as of its own rev, or its own time when
             // it carries none (P2).
             let before = as_of_us.map(|t| rev.clone().unwrap_or_else(|| tid(t)));
-            crate::db::with_change_reason(
+            // Whether a `repo:sync` script runs is decided before the purge
+            // removes the records that make the account count as indexed.
+            let scripts = Box::pin(crate::repo_events::sync_triggers(state, &did, as_of_us)).await;
+            let applied = Box::pin(crate::db::with_change_reason(
                 Some("purge:sync".to_string()),
                 repo_resynced(state, &did, rev.as_deref(), &tracked, before.as_deref()),
-            )
-            .await
+            ))
+            .await;
+            // After the resync purge, so a `repo:sync` script sees the repo
+            // as HappyView now holds it; not when the purge failed, since
+            // the event is applied again.
+            state.repo_event_held.forget(&did);
+            if applied.error.is_none() {
+                Box::pin(crate::repo_events::sync(
+                    state,
+                    &scripts,
+                    &did,
+                    rev.as_deref(),
+                    seq,
+                    time_us,
+                ))
+                .await;
+            }
+            applied
         }
-        SourceEvent::Identity { did, handle } => {
+        SourceEvent::Identity {
+            did,
+            handle,
+            as_of_us,
+            seq,
+            time_us,
+        } => {
             // HappyView caches no DID documents or handles, so there is
-            // nothing to refresh.
+            // nothing to refresh; an `identity:update` script hears of it.
             tracing::debug!(did, ?handle, "jetstream identity event");
+            // Boxed, here and below, so the scripts' futures don't grow
+            // ingest's own, which the stack holds.
+            Box::pin(crate::repo_events::identity(
+                state,
+                &did,
+                handle.as_deref(),
+                as_of_us,
+                seq,
+                time_us,
+            ))
+            .await;
             Applied::ok(IngestOutcome::Skipped)
         }
     }
@@ -531,6 +569,9 @@ async fn write_run(
         }
     };
     let mut changed: HashSet<String> = changed.into_iter().map(|c| c.uri).collect();
+    for (_, ev, _, _) in run.iter() {
+        state.repo_event_held.stored(&ev.key.did);
+    }
 
     // A URI written twice in the run counts as changed once, on its last
     // copy (the one stored).
@@ -891,6 +932,7 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
             timer.finish(&state.metrics, Some((stages::WRITE, started.elapsed())));
             match written {
                 Ok(changed) => {
+                    state.repo_event_held.stored(&ev.key.did);
                     // An identical redelivery changed nothing, so there is
                     // nothing new to log or to fetch labels for.
                     if changed {
@@ -1383,12 +1425,18 @@ async fn account_event(
     time_us: Option<i64>,
     collections: Option<&[String]>,
 ) -> Applied {
+    // Before HappyView acts on it, so an `account:delete` script runs while
+    // the account's records are still held.
+    Box::pin(crate::repo_events::account(
+        state, did, active, status, as_of_us, seq, time_us,
+    ))
+    .await;
     let before = as_of_us.map(tid);
     // The DID tombstone's rev: when the source saw the event.
     let witnessed = time_us
         .or(as_of_us)
         .unwrap_or_else(|| chrono::Utc::now().timestamp_micros());
-    match (active, status) {
+    let applied = match (active, status) {
         (false, Some("deleted")) => {
             crate::db::with_change_reason(
                 Some("purge:deleted".to_string()),
@@ -1425,7 +1473,15 @@ async fn account_event(
         (false, _) if as_of_us.is_some() => Applied::ok(IngestOutcome::Matched),
         (false, status) => account_inactive(state, did, status).await,
         (true, _) => account_active(state, did, before.as_deref()).await,
+    };
+    // A purge changes what is held, so the next event looks again.
+    state.repo_event_held.forget(did);
+    // A deleted account's recorded state goes once it is purged; a purge
+    // that failed is applied again, and must not run account:delete twice.
+    if as_of_us.is_none() && !active && status == Some("deleted") && applied.error.is_none() {
+        Box::pin(crate::repo_events::forget(state, did)).await;
     }
+    applied
 }
 
 /// `active=false` with `status=deleted`, `takendown` or `suspended` (Decision

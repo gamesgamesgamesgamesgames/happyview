@@ -85,7 +85,7 @@ fn kind_name(kind: &LexiconType) -> &'static str {
 
 /// A trigger that runs for a lexicon, as opposed to a job type or a label.
 fn names_a_lexicon(kind: TriggerKind) -> bool {
-    !matches!(kind, TriggerKind::LabelerApply | TriggerKind::JobRun)
+    !matches!(kind, TriggerKind::LabelerApply | TriggerKind::JobRun) && !kind.is_repo_event()
 }
 
 pub async fn outline(registry: &PluginRegistry, root: &Path) -> Outline {

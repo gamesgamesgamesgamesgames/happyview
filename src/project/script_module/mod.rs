@@ -346,7 +346,11 @@ fn check_trigger(
         | TriggerKind::RecordCreate
         | TriggerKind::RecordUpdate
         | TriggerKind::RecordDelete => LexiconType::Record,
-        TriggerKind::JobRun | TriggerKind::LabelerApply => return Ok(()),
+        TriggerKind::JobRun
+        | TriggerKind::LabelerApply
+        | TriggerKind::Identity
+        | TriggerKind::Account
+        | TriggerKind::Repo => return Ok(()),
     };
     let Some(lexicon) = lexicons.get(&parsed.suffix) else {
         return Err(format!(

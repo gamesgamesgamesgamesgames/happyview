@@ -210,7 +210,13 @@ pub(crate) fn marker_event(
             time_us,
             collections: Some(sync_scope.to_vec()),
         },
-        EventKind::Identity { handle } => SourceEvent::Identity { did, handle },
+        EventKind::Identity { handle } => SourceEvent::Identity {
+            did,
+            handle,
+            as_of_us,
+            seq,
+            time_us,
+        },
         EventKind::Commit(_) => unreachable!("a commit is not a marker"),
     }
 }

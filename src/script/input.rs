@@ -21,6 +21,10 @@ use crate::project::snapshot::{ProjectScript, ProjectSnapshot};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Trigger<'a> {
     RecordEvent,
+    /// An identity, account or sync event. It runs under the record-event
+    /// contract on the wire, so every interpreter already reads it, and
+    /// its return value is ignored.
+    RepoEvent,
     Label,
     XrpcQuery,
     XrpcProcedure,
@@ -35,7 +39,7 @@ impl<'a> Trigger<'a> {
     /// The contract the script's result is read under.
     pub fn kind(self) -> ScriptKind {
         match self {
-            Self::RecordEvent => ScriptKind::RecordEvent,
+            Self::RecordEvent | Self::RepoEvent => ScriptKind::RecordEvent,
             Self::Label => ScriptKind::Label,
             Self::XrpcQuery => ScriptKind::XrpcQuery,
             Self::XrpcProcedure => ScriptKind::XrpcProcedure,
@@ -64,6 +68,9 @@ impl<'a> Trigger<'a> {
                 None,
             ) => Some(Self::RecordEvent),
             (TriggerKind::LabelerApply, None) => Some(Self::Label),
+            (TriggerKind::Identity | TriggerKind::Account | TriggerKind::Repo, None) => {
+                Some(Self::RepoEvent)
+            }
             (TriggerKind::XrpcQuery, None) => Some(Self::XrpcQuery),
             (TriggerKind::XrpcProcedure, None) => Some(Self::XrpcProcedure),
         }

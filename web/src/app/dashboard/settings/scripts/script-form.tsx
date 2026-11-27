@@ -40,6 +40,16 @@ export const ACTOR_SUFFIX = "_actor";
 export const JOB_SOURCE = "_job";
 
 /**
+ * Sentinel value for the source selector when the operator picks identity,
+ * account and sync events. The action picks both the kind and the event.
+ */
+export const ACCOUNT_SOURCE = "_account";
+
+function isAccountKind(kind: TriggerKind): boolean {
+  return kind === "identity" || kind === "account" || kind === "repo";
+}
+
+/**
  * Where the script pages send the operator when they leave. The lexicon
  * detail page links here with `?lexicon=<nsid>` so adding several triggers
  * returns to that lexicon each time. The NSID is taken rather than a full
@@ -89,6 +99,7 @@ export function stateFromScript(args: {
   const suffix = parsed?.suffix ?? "";
   let source = suffix;
   if (kind === "job.run") source = JOB_SOURCE;
+  else if (isAccountKind(kind)) source = ACCOUNT_SOURCE;
   else if (suffix === ACTOR_SUFFIX) source = ACTOR_SUFFIX;
   return {
     kind,
@@ -112,6 +123,13 @@ export function composeTriggerId(state: ScriptFormState): string {
 interface ActionOption {
   kind: TriggerKind;
   label: string;
+  /** For an action that names its event too: the trigger's suffix. */
+  suffix?: string;
+}
+
+/** The value an action has in the picker. */
+function actionValue(kind: TriggerKind, suffix?: string): string {
+  return suffix ? `${kind}:${suffix}` : kind;
 }
 
 const ACTOR_ACTIONS: ActionOption[] = [
@@ -135,6 +153,20 @@ const PROCEDURE_ACTIONS: ActionOption[] = [
 ];
 
 const JOB_ACTIONS: ActionOption[] = [{ kind: "job.run", label: "Job runner" }];
+
+const ACCOUNT_ACTIONS: ActionOption[] = [
+  { kind: "identity", suffix: "update", label: "Identity update" },
+  { kind: "account", suffix: "update", label: "Any account event" },
+  { kind: "account", suffix: "activate", label: "Account activated" },
+  { kind: "account", suffix: "deactivate", label: "Account deactivated" },
+  {
+    kind: "account",
+    suffix: "suspend",
+    label: "Account suspended or taken down",
+  },
+  { kind: "account", suffix: "delete", label: "Account deleted" },
+  { kind: "repo", suffix: "sync", label: "Repo resynced" },
+];
 
 const JOB_TYPE_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 const RESERVED_JOB_PREFIX = "happyview.";
@@ -202,6 +234,7 @@ function actionsFor(
 ): ActionOption[] {
   if (source === ACTOR_SUFFIX) return ACTOR_ACTIONS;
   if (source === JOB_SOURCE) return JOB_ACTIONS;
+  if (source === ACCOUNT_SOURCE) return ACCOUNT_ACTIONS;
   const lex = lexicons.find((l) => l.id === source);
   if (!lex) return [];
   switch (lex.lexicon_type) {
@@ -368,7 +401,10 @@ function TriggerComposer({
     if (actions.length === 0) return;
     const current = stateRef.current;
     if (!actions.some((a) => a.kind === current.kind)) {
-      onChange(withKind(current, actions[0].kind));
+      onChange({
+        ...withKind(current, actions[0].kind),
+        ...(actions[0].suffix ? { suffix: actions[0].suffix } : {}),
+      });
     }
   }, [actions, onChange]);
 
@@ -378,6 +414,15 @@ function TriggerComposer({
         ...withKind(state, "job.run"),
         source: JOB_SOURCE,
         suffix: "",
+      });
+      return;
+    }
+    if (next === ACCOUNT_SOURCE) {
+      const first = ACCOUNT_ACTIONS[0];
+      onChange({
+        ...withKind(state, first.kind),
+        source: ACCOUNT_SOURCE,
+        suffix: first.suffix ?? "",
       });
       return;
     }
@@ -418,6 +463,12 @@ function TriggerComposer({
                   Job
                   <span className="text-muted-foreground ml-2 text-xs">
                     (background job runner)
+                  </span>
+                </SelectItem>
+                <SelectItem value={ACCOUNT_SOURCE}>
+                  Accounts
+                  <span className="text-muted-foreground ml-2 text-xs">
+                    (identity, account and sync events)
                   </span>
                 </SelectItem>
               </SelectGroup>
@@ -482,10 +533,21 @@ function TriggerComposer({
                 Action
               </Label>
               <Select
-                value={state.kind}
-                onValueChange={(v) =>
-                  onChange(withKind(state, v as TriggerKind))
+                value={
+                  state.source === ACCOUNT_SOURCE
+                    ? actionValue(state.kind, state.suffix)
+                    : state.kind
                 }
+                onValueChange={(v) => {
+                  const action = actions.find(
+                    (a) => actionValue(a.kind, a.suffix) === v,
+                  );
+                  if (!action) return;
+                  onChange({
+                    ...withKind(state, action.kind),
+                    ...(action.suffix ? { suffix: action.suffix } : {}),
+                  });
+                }}
                 disabled={actions.length <= 1}
               >
                 <SelectTrigger id="action-pick" size="sm" className="w-full">
@@ -493,7 +555,10 @@ function TriggerComposer({
                 </SelectTrigger>
                 <SelectContent>
                   {actions.map((a) => (
-                    <SelectItem key={a.kind} value={a.kind}>
+                    <SelectItem
+                      key={actionValue(a.kind, a.suffix)}
+                      value={actionValue(a.kind, a.suffix)}
+                    >
                       {a.label}
                     </SelectItem>
                   ))}
