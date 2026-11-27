@@ -167,7 +167,7 @@ await fetch("http://127.0.0.1:3000/admin/service-entries/1", {
   },
   body: JSON.stringify({
     service_type: "AtprotoLabeler",
-    access_mode: "specific",
+    access_mode: "allowlist",
   }),
 });
 ```
@@ -180,7 +180,7 @@ await fetch("http://127.0.0.1:3000/admin/service-entries/1", {
   },
   body: JSON.stringify({
     service_type: "AtprotoLabeler",
-    access_mode: "specific",
+    access_mode: "allowlist",
   }),
 });
 ```
@@ -190,13 +190,13 @@ client
     .bearer_auth(token)
     .json(&serde_json::json!({
         "service_type": "AtprotoLabeler",
-        "access_mode": "specific"
+        "access_mode": "allowlist"
     }))
     .send()
     .await?;
 ```
 ```go tab="Go" tab-group="language"
-body := bytes.NewBufferString(`{"service_type": "AtprotoLabeler", "access_mode": "specific"}`)
+body := bytes.NewBufferString(`{"service_type": "AtprotoLabeler", "access_mode": "allowlist"}`)
 req, _ := http.NewRequest("PUT", "http://127.0.0.1:3000/admin/service-entries/1", body)
 req.Header.Set("Authorization", "Bearer "+token)
 req.Header.Set("Content-Type", "application/json")
@@ -206,14 +206,14 @@ resp, err := http.DefaultClient.Do(req)
 curl -X PUT http://127.0.0.1:3000/admin/service-entries/1 \
   -H "$AUTH" \
   -H "Content-Type: application/json" \
-  -d '{ "service_type": "AtprotoLabeler", "access_mode": "specific" }'
+  -d '{ "service_type": "AtprotoLabeler", "access_mode": "allowlist" }'
 ```
 
 | Field          | Type   | Required | Description                                        |
 | -------------- | ------ | -------- | -------------------------------------------------- |
 | `fragment_id`  | string | no       | Updated DID document fragment                      |
 | `service_type` | string | no       | Updated service type                               |
-| `access_mode`  | string | no       | `all` (routes every XRPC) or `specific` (only the lexicons bound to it) |
+| `access_mode`  | string | no       | `all`, `allowlist`, or `disabled`                  |
 
 All fields are optional. Only provided fields are updated.
 
