@@ -58,6 +58,7 @@ pub async fn issue_credential(
         authority_did,
         bound_key,
         crate::spaces::authority::SIGNING_KID,
+        crate::spaces::UriForm::Legacy,
     )
     .await
 }
@@ -79,6 +80,9 @@ pub async fn issue_credential_as(
     authority_did: &str,
     bound_key: Option<&str>,
     kid: &str,
+    // The form the credential names its space in (`sub`): the form the
+    // request did, so the repo hosts it is shown to read it as they write it.
+    uri_form: crate::spaces::UriForm,
 ) -> Result<IssuedCredential, AppError> {
     let auth_ctx = ServiceAuthCtx {
         pool,
@@ -105,10 +109,10 @@ pub async fn issue_credential_as(
 
     let claims = SpaceCredentialClaims {
         iss: space.authority_did.clone(),
-        sub: format!(
+        sub: uri_form.write(&format!(
             "at://{}/space/{}/{}",
             space.did, space.type_nsid, space.skey
-        ),
+        )),
         iat: now,
         exp,
         jti: make_jti(),
@@ -401,20 +405,66 @@ async fn check_user_access_with_managing_app(
     // so an app that upgrades is asked its new way at once. An app on an
     // earlier revision costs one unanswered request per method it lacks.
     for method in &CheckMethod::NEWEST_FIRST {
-        let Some(params) = method.params(space_uri, user_did, client_id, access) else {
-            return Ok(false);
+        // `checkAccess` names the space as `at:space/`, as Proposal 0016 has
+        // since Nov 24, 2026, and once more as `at://…/space/…` if the app
+        // refuses that request as malformed or denies it: an app written
+        // before the change may not recognise the space in the new form. The
+        // older methods predate `at:space/`.
+        let forms: &[crate::spaces::UriForm] = match method {
+            CheckMethod::Nov12 => &[
+                crate::spaces::UriForm::AtSpace,
+                crate::spaces::UriForm::Legacy,
+            ],
+            CheckMethod::Oct29 | CheckMethod::Simplespace => &[crate::spaces::UriForm::Legacy],
         };
-        match ask_managing_app(
-            http,
-            auth_ctx,
-            &endpoint,
-            managing_app,
-            authority_did,
-            *method,
-            &params,
-        )
-        .await?
-        {
+        let mut answer = None;
+        for (i, form) in forms.iter().enumerate() {
+            let space = form.write(space_uri);
+            let Some(params) = method.params(&space, user_did, client_id, access) else {
+                return Ok(false);
+            };
+            match ask_managing_app(
+                http,
+                auth_ctx,
+                &endpoint,
+                managing_app,
+                authority_did,
+                *method,
+                &params,
+            )
+            .await
+            {
+                Err(AppError::XrpcError { message, .. })
+                    if i + 1 < forms.len() && message.ends_with(" with 400 Bad Request") =>
+                {
+                    continue;
+                }
+                // The earlier form was refused or denied; this form's failure
+                // leaves that answer standing.
+                Err(_) if answer.is_some() => break,
+                other => {
+                    let this = other?;
+                    // Only a decision replaces the earlier form's denial: an
+                    // app that doesn't implement the method in this form, or
+                    // refuses it, leaves that denial final, rather than
+                    // sending the check on to an older method.
+                    if answer.is_some() && !matches!(this, Answer::Decided(_)) {
+                        break;
+                    }
+                    let denied = matches!(&this, Answer::Decided(a)
+                        if method.decision(a, access) == Some(false));
+                    answer = Some(this);
+                    if denied && i + 1 < forms.len() {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        let Some(answer) = answer else {
+            unreachable!("the last form's answer always breaks the loop")
+        };
+        match answer {
             Answer::Decided(answer) => {
                 return method.decision(&answer, access).ok_or_else(|| {
                     upstream_failure(format!(

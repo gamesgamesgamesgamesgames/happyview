@@ -189,7 +189,13 @@ async fn list_spaces_speaks_both_revisions() {
     let all = list(String::new()).await;
     assert_eq!(all.len(), 2);
     for view in &all {
-        assert_eq!(view["uri"], view["space"], "{view}");
+        // `uri` (Oct 29) in the form its clients read, `space` in the current
+        // form.
+        assert_eq!(
+            view["space"],
+            json!(happyview::spaces::UriForm::AtSpace.write(view["uri"].as_str().unwrap())),
+            "{view}"
+        );
     }
 
     let did_of = |uri: &str| {
@@ -205,7 +211,7 @@ async fn list_spaces_speaks_both_revisions() {
     ))
     .await;
     assert_eq!(narrowed.len(), 1);
-    assert_eq!(narrowed[0]["space"], json!(second));
+    assert_eq!(narrowed[0]["uri"], json!(second));
 
     let narrowed = list(format!(
         "?spaceDid={}",
@@ -213,7 +219,7 @@ async fn list_spaces_speaks_both_revisions() {
     ))
     .await;
     assert_eq!(narrowed.len(), 1);
-    assert_eq!(narrowed[0]["space"], json!(first));
+    assert_eq!(narrowed[0]["uri"], json!(first));
 
     let none = list("?spaceDid=did%3Aplc%3Anobody".into()).await;
     assert!(none.is_empty());

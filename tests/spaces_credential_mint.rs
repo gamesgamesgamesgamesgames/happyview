@@ -1062,7 +1062,8 @@ async fn own_did_space_and_token(app: &TestApp, skey: &str) -> (String, String, 
         .unwrap();
     let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let space = json_of(resp).await["space"].as_str().unwrap().to_string();
+    // `uri`, the `at://` form, which this test takes apart.
+    let space = json_of(resp).await["uri"].as_str().unwrap().to_string();
     let space_did = space
         .trim_start_matches("at://")
         .split('/')

@@ -87,7 +87,7 @@ pub(crate) async fn verify_space_credential(
         "at://{}/space/{}/{}",
         space.did, space.type_nsid, space.skey
     );
-    if claims.sub != space_uri {
+    if !crate::spaces::same_space_uri(&claims.sub, &space_uri) {
         return Err(AppError::XrpcError {
             status: axum::http::StatusCode::BAD_REQUEST,
             code: "InvalidCredential",
@@ -551,18 +551,30 @@ pub(crate) async fn forward_write_if_native(
             ))
         })?;
 
-    let resp = crate::repo::pds::pds_post_json_raw(state, &session, method, &body).await?;
-    if !resp.status().is_success() {
-        let detail = resp.text().await.unwrap_or_default();
-        return Err(AppError::BadGateway(format!(
-            "the user's PDS rejected {method}: {detail}"
-        )));
-    }
-
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to read PDS response: {e}")))?;
+    // The space named in the form the author's host, the one the session
+    // calls, takes.
+    let pds = Some(atrium_xrpc::XrpcClient::base_uri(&session));
+    let space = body["space"].as_str().unwrap_or_default().to_string();
+    let bytes =
+        crate::spaces::pds_support::with_space_uri_form(state, pds.as_deref(), &space, |space| {
+            let mut body = body.clone();
+            body["space"] = space.into();
+            let session = &session;
+            async move {
+                let resp =
+                    crate::repo::pds::pds_post_json_raw(state, session, method, &body).await?;
+                if !resp.status().is_success() {
+                    let detail = resp.text().await.unwrap_or_default();
+                    return Err(AppError::BadGateway(format!(
+                        "the user's PDS rejected {method}: {detail}"
+                    )));
+                }
+                resp.bytes()
+                    .await
+                    .map_err(|e| AppError::Internal(format!("failed to read PDS response: {e}")))
+            }
+        })
+        .await?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| AppError::Internal(format!("PDS returned invalid JSON: {e}")))?;
     Ok(Some(value))

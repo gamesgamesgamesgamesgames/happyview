@@ -1102,6 +1102,28 @@ enum ManagingAppAnswer {
     OnlyAt(&'static str, wiremock::ResponseTemplate),
     /// Its service endpoint is a port nothing listens on.
     Unreachable,
+    /// It refuses a space named in the `at:space/` form as malformed (400),
+    /// and answers this to the `at://…/space/…` form.
+    RefusesAtSpace(wiremock::ResponseTemplate),
+    /// It answers this to a space named in the `at:space/` form, and that to
+    /// the `at://…/space/…` form.
+    AnswersByForm(wiremock::ResponseTemplate, wiremock::ResponseTemplate),
+    /// It denies a space named in the `at:space/` form, doesn't implement
+    /// `checkAccess` for the earlier form (404), and would admit through
+    /// any older method.
+    DeniesAtSpaceOlderAdmit,
+}
+
+/// A request naming its space in the `at:space/` form.
+struct NamesAtSpace;
+
+impl wiremock::Match for NamesAtSpace {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        request
+            .url
+            .query_pairs()
+            .any(|(k, v)| k == "space" && v.starts_with("at:space/"))
+    }
 }
 
 /// A newcomer's `notifyWrite` to a space a managing app governs, answered by
@@ -1154,6 +1176,62 @@ async fn through_managing_app(
             Mock::given(method("GET"))
                 .and(path(at))
                 .respond_with(response)
+                .mount(&managing_app)
+                .await;
+            managing_app.uri()
+        }
+        ManagingAppAnswer::RefusesAtSpace(response) => {
+            Mock::given(method("GET"))
+                .and(NamesAtSpace)
+                .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(
+                    json!({ "error": "InvalidRequest", "message": "Invalid space-ref format" }),
+                ))
+                .with_priority(1)
+                .mount(&managing_app)
+                .await;
+            Mock::given(method("GET"))
+                .respond_with(response)
+                .with_priority(2)
+                .mount(&managing_app)
+                .await;
+            managing_app.uri()
+        }
+        ManagingAppAnswer::AnswersByForm(at_space, legacy) => {
+            Mock::given(method("GET"))
+                .and(NamesAtSpace)
+                .respond_with(at_space)
+                .with_priority(1)
+                .mount(&managing_app)
+                .await;
+            Mock::given(method("GET"))
+                .respond_with(legacy)
+                .with_priority(2)
+                .mount(&managing_app)
+                .await;
+            managing_app.uri()
+        }
+        ManagingAppAnswer::DeniesAtSpaceOlderAdmit => {
+            Mock::given(method("GET"))
+                .and(NamesAtSpace)
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(json!({ "read": false, "write": false })),
+                )
+                .with_priority(1)
+                .mount(&managing_app)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/xrpc/com.atproto.managedspace.checkAccess"))
+                .respond_with(wiremock::ResponseTemplate::new(404))
+                .with_priority(2)
+                .mount(&managing_app)
+                .await;
+            Mock::given(method("GET"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(json!({ "authorized": true, "read": true, "write": true })),
+                )
+                .with_priority(3)
                 .mount(&managing_app)
                 .await;
             managing_app.uri()
@@ -1837,4 +1915,100 @@ async fn a_managing_app_that_answers_too_late_is_an_upstream_failure() {
     let (status, _, body) = through_managing_app(late, Ask::NotifyWrite).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(body["error"], json!("UpstreamFailure"), "{body}");
+}
+
+/// `checkAccess` names the space as `at:space/`, and an app that refuses that
+/// form as malformed is asked once more in the `at://` form.
+#[tokio::test]
+#[serial]
+async fn check_access_names_the_space_as_at_space_then_as_before() {
+    common::require_db!();
+    let (status, asked, body) = through_managing_app(
+        ManagingAppAnswer::RefusesAtSpace(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({ "read": true, "write": true })),
+        ),
+        Ask::NotifyWrite,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        asked,
+        vec![
+            "com.atproto.managedspace.checkAccess".to_string(),
+            "com.atproto.managedspace.checkAccess".to_string()
+        ],
+        "the same method, in each form"
+    );
+}
+
+/// An app written before `at:space/` may not recognise a space named in it,
+/// and deny it rather than refuse the request. It is asked once more in the
+/// `at://…/space/…` form, and admits as it always did.
+#[tokio::test]
+#[serial]
+async fn check_access_denied_as_at_space_is_asked_as_before() {
+    common::require_db!();
+    let decided = |read: bool| {
+        wiremock::ResponseTemplate::new(200).set_body_json(json!({ "read": read, "write": read }))
+    };
+    let (status, asked, body) = through_managing_app(
+        ManagingAppAnswer::AnswersByForm(decided(false), decided(true)),
+        Ask::NotifyWrite,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(asked.len(), 2, "{asked:?}");
+
+    // Denied in both forms is denied.
+    let (status, asked, body) = through_managing_app(
+        ManagingAppAnswer::AnswersByForm(decided(false), decided(false)),
+        Ask::NotifyWrite,
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(asked.len(), 2, "{asked:?}");
+
+    // Allowed in the at:space/ form is asked once.
+    let (status, asked, body) = through_managing_app(
+        ManagingAppAnswer::AnswersByForm(decided(true), decided(false)),
+        Ask::NotifyWrite,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(asked.len(), 1, "{asked:?}");
+
+    // A denial in the at:space/ form stands when the earlier form fails.
+    let (status, asked, body) = through_managing_app(
+        ManagingAppAnswer::AnswersByForm(decided(false), wiremock::ResponseTemplate::new(500)),
+        Ask::NotifyWrite,
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_ne!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "a denial, not a failure: {body}"
+    );
+    assert_eq!(asked.len(), 2, "{asked:?}");
+}
+
+/// A denial in the `at:space/` form is final when the app doesn't implement
+/// the method for the earlier form: the check isn't sent on to an older
+/// method that might admit.
+#[tokio::test]
+#[serial]
+async fn a_denial_is_not_reopened_by_an_older_method() {
+    common::require_db!();
+    let (status, asked, body) =
+        through_managing_app(ManagingAppAnswer::DeniesAtSpaceOlderAdmit, Ask::NotifyWrite).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        asked,
+        vec![
+            "com.atproto.managedspace.checkAccess".to_string(),
+            "com.atproto.managedspace.checkAccess".to_string()
+        ],
+        "no older method is asked"
+    );
 }

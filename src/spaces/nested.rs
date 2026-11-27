@@ -138,7 +138,16 @@ async fn list_nested_spaces(
     Query(query): Query<ListNestedQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let (space, _) = owned_space(&state, &claims, &query.space, SpaceTarget::Read).await?;
-    let nested = db::list_nested(&state.db, state.db_backend, &space.id).await?;
+    // Each nested space named in the form the request named this one in.
+    let form = crate::spaces::UriForm::of(&query.space);
+    let nested: Vec<_> = db::list_nested(&state.db, state.db_backend, &space.id)
+        .await?
+        .into_iter()
+        .map(|mut n| {
+            n.target_space_uri = form.write(&n.target_space_uri);
+            n
+        })
+        .collect();
     Ok(Json(serde_json::json!({ "nested": nested })))
 }
 

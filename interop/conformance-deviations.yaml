@@ -69,54 +69,6 @@
   expect:
     message: "a read with a space credential and a MAC request came back with no MAC"
 
-# --- apply-writes-shape ----------------------------------------------------
-- assertion: records.apply-writes-atomic
-  cause: apply-writes-shape
-  reason: "applyWrites takes `action`-tagged writes, not the lexicon's `$type` union, so a spec-shaped batch is refused."
-  spec: "#xrpc-api"
-  tracking: HAP-414
-  since: "2026-11-13"
-  revisions: ["2026-10-29", "2026-11-12"]
-  expect:
-    message: "applyWrites answered 422"
-    evidence:
-      body: "\"Failed to deserialize the JSON body into the target type: writes\\[0\\]: missing field `action` at line 1 column \\d+\""
-- assertion: digest.multi-batch
-  cause: apply-writes-shape
-  reason: "applyWrites takes `action`-tagged writes, not the lexicon's `$type` union, so a spec-shaped batch is refused."
-  spec: "#xrpc-api"
-  tracking: HAP-414
-  since: "2026-11-13"
-  revisions: ["2026-10-29", "2026-11-12"]
-  expect:
-    message: "applyWrites \\(20 writes\\) answered 422"
-    evidence:
-      body: "\"Failed to deserialize the JSON body into the target type: writes\\[0\\]: missing field `action` at line 1 column \\d+\""
-- assertion: oplog.pagination-batch-boundary
-  cause: apply-writes-shape
-  reason: "applyWrites takes `action`-tagged writes, not the lexicon's `$type` union, so a spec-shaped batch is refused."
-  spec: "#xrpc-api"
-  tracking: HAP-414
-  since: "2026-11-13"
-  revisions: ["2026-10-29", "2026-11-12"]
-  expect:
-    message: "applyWrites \\(3 writes\\) answered 422"
-    evidence:
-      body: "\"Failed to deserialize the JSON body into the target type: writes\\[0\\]: missing field `action` at line 1 column \\d+\""
-
-# --- create-record-rkey ----------------------------------------------------
-- assertion: records.crud-roundtrip
-  cause: create-record-rkey
-  reason: "createRecord ignores the caller's `rkey` and assigns a TID."
-  spec: "#xrpc-api"
-  tracking: HAP-414
-  since: "2026-11-13"
-  revisions: ["2026-10-29", "2026-11-12"]
-  expect:
-    message: "createRecord's uri at://did:plc:[a-z2-7]{24}/space/com\\.example\\.conformance\\.space/[0-9a-f]+/did:plc:[a-z2-7]{24}/com\\.example\\.conformance\\.note/[a-z2-7]{13} doesn't end in the chosen rkey"
-    evidence:
-      status: "201"
-
 # --- space-deleted-error ---------------------------------------------------
 - assertion: deletion.credential-error
   cause: space-deleted-error

@@ -390,7 +390,7 @@ pub async fn add_member(
         state,
         caller_did,
         &spec.uri,
-        &spec.did,
+        &crate::spaces::canonical_uri(&spec.did),
         access,
         spec.is_delegation,
     )
@@ -419,7 +419,7 @@ pub async fn set_member(
         state,
         caller_did,
         &spec.uri,
-        &spec.did,
+        &crate::spaces::canonical_uri(&spec.did),
         access,
         spec.is_delegation,
     )
@@ -434,7 +434,13 @@ pub async fn remove_member(
 ) -> Result<(), SpacesError> {
     require_enabled(state).await?;
     // A space named as a member may be nested rather than listed.
-    crate::spaces::nested::remove_space_member(state, caller_did, &spec.uri, &spec.did).await?;
+    crate::spaces::nested::remove_space_member(
+        state,
+        caller_did,
+        &spec.uri,
+        &crate::spaces::canonical_uri(&spec.did),
+    )
+    .await?;
     Ok(())
 }
 

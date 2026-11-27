@@ -434,6 +434,7 @@ fn format_name(format: &str) -> &str {
         "language" => "language code",
         "tid" => "TID",
         "record-key" => "record key",
+        "space-ref" => "space-ref",
         other => other,
     }
 }
@@ -491,15 +492,51 @@ fn format_ok(format: &str, s: &str) -> bool {
         .is_match(s),
         "record-key" => is_record_key(s),
         "at-uri" => at_uri_ok(s),
+        "space-ref" => space_ref_ok(s),
         _ => true,
     }
 }
 
 /// `at://<did or handle>[/<collection nsid>[/<record key>]]`, with an
 /// optional `#fragment`.
+/// A space: `at:space/<did>/<space type nsid>/<skey>`, or the
+/// `at://<did>/space/<nsid>/<skey>` form before it.
+fn space_ref_ok(s: &str) -> bool {
+    s.len() <= 8192
+        && crate::spaces::SpaceUri::parse(s).is_ok_and(|uri| {
+            uri.is_space_uri()
+                && is_did(&uri.did)
+                && happyview_nsid::validate_nsid(&uri.type_nsid).is_ok()
+                && is_record_key(&uri.skey)
+        })
+}
+
+/// A space record's URI, in either form `space_ref_ok` reads.
+fn space_record_uri_ok(s: &str) -> bool {
+    crate::spaces::SpaceUri::parse(s).is_ok_and(|uri| {
+        uri.is_record_uri()
+            && is_did(&uri.did)
+            && happyview_nsid::validate_nsid(&uri.type_nsid).is_ok()
+            && is_record_key(&uri.skey)
+            && uri.user_did.as_deref().is_some_and(is_did)
+            && uri
+                .collection
+                .as_deref()
+                .is_some_and(|c| happyview_nsid::validate_nsid(c).is_ok())
+            && uri.rkey.as_deref().is_some_and(is_record_key)
+    })
+}
+
 fn at_uri_ok(s: &str) -> bool {
     if s.len() > 8192 {
         return false;
+    }
+    // A space, or a record in one, in Proposal 0016's `at:space/` form. Its
+    // `at://…/space/…` form falls through below, where `space` is no NSID, so
+    // the earlier answer for it is kept.
+    if s.starts_with(crate::spaces::AT_SPACE_PREFIX) {
+        let path = s.split_once('#').map_or(s, |(path, _)| path);
+        return space_ref_ok(path) || space_record_uri_ok(path);
     }
     let Some(rest) = s.strip_prefix("at://") else {
         return false;
@@ -517,5 +554,47 @@ fn at_uri_ok(s: &str) -> bool {
             happyview_nsid::validate_nsid(collection).is_ok() && is_record_key(rkey)
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod space_format_tests {
+    use super::format_ok;
+
+    #[test]
+    fn a_space_ref_is_read_in_either_form() {
+        for ok in [
+            "at:space/did:plc:abc123/com.example.forum/main",
+            "at://did:plc:abc123/space/com.example.forum/main",
+        ] {
+            assert!(format_ok("space-ref", ok), "{ok}");
+        }
+        for bad in [
+            "at:space/alice.example/com.example.forum/main",
+            "at:space/did:plc:abc123/notansid/main",
+            "at:space/did:plc:abc123/com.example.forum/main/did:plc:u/com.example.post/k",
+            "at://did:plc:abc123/com.example.post/k",
+            "did:plc:abc123",
+        ] {
+            assert!(!format_ok("space-ref", bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_at_uri_may_name_a_space_or_a_space_record() {
+        for ok in [
+            "at://did:plc:abc123/com.example.post/3k",
+            "at:space/did:plc:abc123/com.example.forum/main",
+            "at:space/did:plc:abc123/com.example.forum/main/did:plc:u/com.example.post/3k",
+            "at:space/did:plc:abc123/com.example.forum/main/did:plc:u/com.example.post/3k#frag",
+        ] {
+            assert!(format_ok("at-uri", ok), "{ok}");
+        }
+        for bad in [
+            "at:space/did:plc:abc123/com.example.forum",
+            "at:space/did:plc:abc123/com.example.forum/main/alice.example/com.example.post/3k",
+        ] {
+            assert!(!format_ok("at-uri", bad), "{bad}");
+        }
     }
 }
