@@ -297,7 +297,7 @@ async fn a_commit_from_another_repo_does_not_verify_as_ours() {
             repo,
             doc,
             fetched.exchange.as_ref(),
-            fetched.mac_header.as_ref(),
+            &fetched.headers,
         )
     };
 

@@ -10,7 +10,6 @@ use crate::AppState;
 use crate::error::AppError;
 use crate::spaces::commit::{SignedCommit, SpaceVerifyingKey, decode_lex_bytes};
 use crate::spaces::space_mac;
-use atrium_xrpc::http::{HeaderName, HeaderValue};
 
 /// What an oplog entry did to its record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,12 +269,12 @@ pub async fn get_verified_commit(
     let exchange = space_mac::author_kem_key(&did_doc)?.map(|key| space_mac::encapsulate(&key));
     let want = exchange
         .as_ref()
-        .map(|exchange| space_mac::want_mac_header(&exchange.key_share))
+        .map(space_mac::commit_mac_request_headers)
         .transpose()?;
     let pds = crate::profile::find_service_endpoint(&did_doc, "atproto_pds");
 
     // The space named in the form the author's host takes.
-    let (body, mac_header) = crate::spaces::pds_support::with_space_uri_form(
+    let (body, headers) = crate::spaces::pds_support::with_space_uri_form(
         state,
         pds.as_deref(),
         space_uri,
@@ -296,20 +295,10 @@ pub async fn get_verified_commit(
                 );
                 match want {
                     Some(want) => {
-                        let (body, received) = crate::http_retry::with_header_exchange(
-                            (
-                                HeaderName::from_static(space_mac::WANT_MAC_HEADER),
-                                HeaderValue::from_str(&want).map_err(|_| {
-                                    AppError::Internal("unsendable MAC request".into())
-                                })?,
-                            ),
-                            HeaderName::from_static(space_mac::MAC_HEADER),
-                            request,
-                        )
-                        .await;
+                        let (body, received) = crate::http_retry::with_headers(want, request).await;
                         Ok((body?, received))
                     }
-                    None => Ok((request.await?, None)),
+                    None => Ok((request.await?, axum::http::HeaderMap::new())),
                 }
             }
         },
@@ -325,7 +314,7 @@ pub async fn get_verified_commit(
         author_did,
         &did_doc,
         exchange.as_ref(),
-        mac_header.as_ref(),
+        &headers,
     )
 }
 
@@ -336,7 +325,7 @@ pub fn verify_remote_commit(
     author_did: &str,
     did_doc: &crate::profile::DidDocument,
     exchange: Option<&space_mac::Encapsulation>,
-    mac_header: Option<&HeaderValue>,
+    headers: &axum::http::HeaderMap,
 ) -> Result<VerifiedCommit, AppError> {
     if commit.get("data").is_none() {
         let commit = parse_signed_commit(commit)?;
@@ -364,23 +353,7 @@ pub fn verify_remote_commit(
              cannot be authenticated"
         ))
     })?;
-    let mac_header = mac_header.ok_or_else(|| {
-        AppError::Auth(format!(
-            "the repo host sent a commit without the {} header it was asked for",
-            space_mac::MAC_HEADER
-        ))
-    })?;
-    let mac =
-        space_mac::parse_mac_header(mac_header.to_str().map_err(|_| {
-            AppError::Auth(format!("{} header is not text", space_mac::MAC_HEADER))
-        })?)?;
-    space_mac::verify_commit(
-        &commit,
-        space_uri,
-        author_did,
-        &exchange.shared_secret,
-        &mac,
-    )?;
+    space_mac::verify_commit_response(&commit, space_uri, author_did, exchange, headers)?;
     Ok(VerifiedCommit::Mac(commit))
 }
 
@@ -681,7 +654,7 @@ mod tests {
     fn mac_commit(
         exchange: &space_mac::Encapsulation,
         data: [u8; 32],
-    ) -> (serde_json::Value, HeaderValue) {
+    ) -> (serde_json::Value, axum::http::HeaderMap) {
         use base64::Engine;
         let commit = space_mac::Commit {
             ver: 1,
@@ -702,7 +675,12 @@ mod tests {
             "rev": "3krev",
             "data": encode_lex_bytes(&data),
         });
-        (json, HeaderValue::from_str(&header).unwrap())
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            space_mac::MAC_HEADER,
+            axum::http::HeaderValue::from_str(&header).unwrap(),
+        );
+        (json, headers)
     }
 
     #[test]
@@ -711,12 +689,73 @@ mod tests {
         let exchange = space_mac::encapsulate(&space_mac::author_kem_key(&doc).unwrap().unwrap());
         let (json, header) = mac_commit(&exchange, [0xAA; 32]);
 
-        let commit =
-            verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&exchange), Some(&header))
-                .expect("a MACed commit must verify");
+        let commit = verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&exchange), &header)
+            .expect("a MACed commit must verify");
         assert!(matches!(commit, VerifiedCommit::Mac(_)));
         assert_eq!(commit.hash(), &[0xAA; 32]);
         assert_eq!(commit.rev(), "3krev");
+    }
+
+    /// A 0016 commit, and the headers a Nov 12 host would answer it with.
+    fn nov12_commit(
+        exchange: &space_mac::Encapsulation,
+        data: [u8; 32],
+    ) -> (serde_json::Value, axum::http::HeaderMap) {
+        use base64::Engine;
+        use hmac::{KeyInit, Mac};
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let covered = format!(
+            r#"ver=1, repo="{AUTHOR}", space="{SPACE}", rev="3krev", data=:{}:"#,
+            b64(&data)
+        );
+        let params = format!(
+            r#"("atproto-space-commit";sf);keyid="{}";tag="atproto-space-commit""#,
+            exchange.key_share
+        );
+        let base =
+            format!("\"atproto-space-commit\";sf: {covered}\n\"@signature-params\": {params}");
+        let mut mac =
+            <hmac::Hmac<sha2::Sha256> as KeyInit>::new_from_slice(&exchange.export_secret).unwrap();
+        mac.update(base.as_bytes());
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in [
+            ("atproto-space-commit", covered),
+            ("signature-input", format!("mac={params}")),
+            (
+                "signature",
+                format!("mac=:{}:", b64(&mac.finalize().into_bytes())),
+            ),
+        ] {
+            headers.insert(name, axum::http::HeaderValue::from_str(&value).unwrap());
+        }
+        let json = serde_json::json!({
+            "ver": 1,
+            "repo": AUTHOR,
+            "space": SPACE,
+            "rev": "3krev",
+            "data": encode_lex_bytes(&data),
+        });
+        (json, headers)
+    }
+
+    #[test]
+    fn a_0016_commit_verifies_by_its_nov12_mac() {
+        let doc = did_doc(None, Some(&kem_key()));
+        let exchange = space_mac::encapsulate(&space_mac::author_kem_key(&doc).unwrap().unwrap());
+        let (json, headers) = nov12_commit(&exchange, [0xAA; 32]);
+        let commit = verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&exchange), &headers)
+            .expect("a Nov 12 MAC must verify");
+        assert!(matches!(commit, VerifiedCommit::Mac(_)));
+        assert_eq!(commit.hash(), &[0xAA; 32]);
+
+        // Under another exchange, or for another body, it doesn't.
+        let other = space_mac::encapsulate(&space_mac::author_kem_key(&doc).unwrap().unwrap());
+        assert!(verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&other), &headers).is_err());
+        let (tampered, _) = nov12_commit(&exchange, [0xAB; 32]);
+        assert!(
+            verify_remote_commit(&tampered, SPACE, AUTHOR, &doc, Some(&exchange), &headers)
+                .is_err()
+        );
     }
 
     #[test]
@@ -726,24 +765,25 @@ mod tests {
         let (json, header) = mac_commit(&exchange, [0xAA; 32]);
 
         // The host ignored the request for a MAC.
-        assert!(verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&exchange), None).is_err());
-        // The author publishes no KEM key, so no MAC could be asked for.
         assert!(
             verify_remote_commit(
                 &json,
                 SPACE,
                 AUTHOR,
-                &did_doc(None, None),
-                None,
-                Some(&header)
+                &doc,
+                Some(&exchange),
+                &axum::http::HeaderMap::new()
             )
             .is_err()
         );
+        // The author publishes no KEM key, so no MAC could be asked for.
+        assert!(
+            verify_remote_commit(&json, SPACE, AUTHOR, &did_doc(None, None), None, &header)
+                .is_err()
+        );
         // A MAC computed under another exchange is not this request's.
         let other = space_mac::encapsulate(&space_mac::author_kem_key(&doc).unwrap().unwrap());
-        assert!(
-            verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&other), Some(&header)).is_err()
-        );
+        assert!(verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&other), &header).is_err());
     }
 
     #[test]
@@ -761,7 +801,7 @@ mod tests {
             AUTHOR,
             &doc,
             Some(&exchange),
-            None,
+            &axum::http::HeaderMap::new(),
         )
         .expect("a signed commit must verify");
         assert!(matches!(commit, VerifiedCommit::Signed(_)));
