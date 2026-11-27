@@ -121,6 +121,7 @@ pub async fn build_snapshot_with(
 
     let mut pending = Vec::new();
     let mut handled_by: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut event_scripts: Vec<String> = Vec::new();
     for file in files.iter().filter(|f| !layout::is_lexicon(f)) {
         diagnostics.extend(layout::wrong_case_extension(file, &claims));
         let role = match layout::classify(file, &claims, &index) {
@@ -147,15 +148,17 @@ pub async fn build_snapshot_with(
                     continue;
                 }
                 // Files named after an event in these directories were modules
-                // before they named scripts: say so where one is a script now.
+                // before they named scripts: listed at boot, and named where a
+                // deploy turns a module into one.
                 if trigger.kind.is_repo_event() {
                     let path = file.rel_path().to_string_lossy().replace('\\', "/");
-                    if env.current.generation == 0 || env.current.modules.contains_key(&path) {
+                    if env.current.generation == 0 {
+                        event_scripts.push(path);
+                    } else if env.current.modules.contains_key(&path) {
                         diagnostics.push(Diagnostic::warning(
                             file.rel_path(),
                             format!(
-                                "runs as the {id} script; a file named after an event in src/identity/, \
-                                 src/account/ or src/repo/ is a script, so rename it if it is a module"
+                                "was a module and now runs as the {id} script; rename it if it is a module"
                             ),
                         ));
                     }
@@ -197,6 +200,15 @@ pub async fn build_snapshot_with(
                 }
             }
         }
+    }
+    if !event_scripts.is_empty() {
+        diagnostics.push(Diagnostic::warning(
+            PathBuf::from("src"),
+            format!(
+                "files named after an event in src/identity/, src/account/ or src/repo/ run as scripts: {}",
+                event_scripts.join(", ")
+            ),
+        ));
     }
 
     // Compiled modules claim triggers as files do, so they join the same
@@ -704,9 +716,12 @@ mod tests {
                 .contains_key("src/account/helpers.echo")
         );
         let warned = shown(&report.warnings);
-        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert_eq!(warned.len(), 1, "one line: {warned:?}");
         assert!(warned[0].contains("src/account/delete.echo"), "{warned:?}");
-        assert!(warned[0].contains("account:delete"), "{warned:?}");
+        assert!(
+            !warned[0].contains("helpers"),
+            "a module isn't listed: {warned:?}"
+        );
     }
 
     #[tokio::test]
