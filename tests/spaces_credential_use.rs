@@ -478,7 +478,7 @@ async fn revocation_reaches_the_native_host(revoke: impl Fn(&str) -> (&'static s
 
     let pds = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/xrpc/com.atproto.space.notifyCredentialRevoked"))
+        .and(path("/xrpc/com.atproto.space.notifyCredentialsRevoked"))
         .respond_with(ResponseTemplate::new(200))
         .mount(&pds)
         .await;
@@ -548,7 +548,11 @@ async fn revocation_reaches_the_native_host(revoke: impl Fn(&str) -> (&'static s
         .unwrap();
         claims["jti"].clone()
     };
-    assert_eq!(body["space"], json!(space));
+    // Sent in the current form, `at:space/`.
+    assert_eq!(
+        body["space"],
+        json!(happyview::spaces::UriForm::AtSpace.write(&space))
+    );
     assert_eq!(body["credentials"], json!([jti]));
     // The space has a DID of its own, and revokes as it.
     assert!(authority.starts_with("did:plc:"), "{authority}");
@@ -559,6 +563,149 @@ async fn revocation_reaches_the_native_host(revoke: impl Fn(&str) -> (&'static s
         .to_str()
         .unwrap();
     app.assert_signed_as_space(authorization, authority).await;
+}
+
+/// The bodies `MEMBER`'s native repo host is sent when `MEMBER` is removed,
+/// with the host answering as `host` says, and the space's `at://` URI.
+async fn revocations_sent_to(
+    host: Vec<wiremock::Mock>,
+    expected: usize,
+) -> (String, Vec<Value>, TestApp, String) {
+    use wiremock::MockServer;
+
+    let mut app = TestApp::new_with_encryption().await;
+    let key = key();
+    let (space, _) = setup(&mut app, &key).await;
+
+    let pds = MockServer::start().await;
+    for mock in host {
+        mock.mount(&pds).await;
+    }
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    plc_store.write().await.insert(
+        MEMBER.to_string(),
+        json!({
+            "id": MEMBER,
+            "verificationMethod": [],
+            "service": [{ "id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": pds.uri() }],
+        }),
+    );
+
+    let mut parts = space.strip_prefix("at://").unwrap().split('/');
+    let (authority, _, space_type, skey) = (
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+    );
+    let space_row = happyview::spaces::db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        authority,
+        space_type,
+        skey,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut conn = app.state.db.acquire().await.unwrap();
+    let mut repo_state = happyview::spaces::db::get_or_create_repo_state(
+        &mut conn,
+        app.state.db_backend,
+        &space_row.id,
+        MEMBER,
+    )
+    .await
+    .unwrap();
+    repo_state.host_mode = happyview::spaces::host_mode::HostMode::Native;
+    happyview::spaces::db::update_repo_state(&mut *conn, app.state.db_backend, &repo_state)
+        .await
+        .unwrap();
+    drop(conn);
+
+    space_admin(
+        &app,
+        "com.atproto.memberspace.removeMembers",
+        json!({ "space": space, "dids": [MEMBER] }),
+    )
+    .await;
+    for _ in 0..50 {
+        let received = pds.received_requests().await.unwrap_or_default();
+        if received.len() >= expected {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // Anything further would have arrived with the rest.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let received = pds.received_requests().await.unwrap_or_default();
+    let bodies = received
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    (space, bodies, app, pds.uri())
+}
+
+/// A host that takes only the `at://…/space/…` form is sent a revocation once
+/// more in it, and remembered; an unrelated refusal is neither retried nor
+/// remembered.
+#[tokio::test]
+#[serial]
+async fn a_revocation_falls_back_to_the_earlier_form_only_when_the_form_is_refused() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    common::require_db!();
+    let lxm = "/xrpc/com.atproto.space.notifyCredentialsRevoked";
+    let (space, bodies, app, pds) = revocations_sent_to(
+        vec![
+            Mock::given(method("POST"))
+                .and(path(lxm))
+                .and(body_string_contains("at:space/"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(
+                    json!({ "error": "InvalidRequest", "message": "Invalid space-ref format: space" }),
+                ))
+                .with_priority(1),
+            Mock::given(method("POST"))
+                .and(path(lxm))
+                .respond_with(ResponseTemplate::new(200))
+                .with_priority(2),
+        ],
+        2,
+    )
+    .await;
+    let spaces: Vec<_> = bodies.iter().map(|b| b["space"].clone()).collect();
+    assert_eq!(
+        spaces,
+        [
+            json!(happyview::spaces::UriForm::AtSpace.write(&space)),
+            json!(space)
+        ]
+    );
+    assert_eq!(
+        happyview::spaces::pds_support::space_uri_form(&app.state.db, app.state.db_backend, &pds)
+            .await
+            .unwrap(),
+        happyview::spaces::UriForm::Legacy
+    );
+    // One app holds the test database at a time.
+    drop(app);
+
+    let (_, bodies, app, pds) = revocations_sent_to(
+        vec![Mock::given(method("POST")).and(path(lxm)).respond_with(
+            ResponseTemplate::new(400).set_body_json(
+                json!({ "error": "InvalidRequest", "message": "too many credentials" }),
+            ),
+        )],
+        1,
+    )
+    .await;
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert_eq!(
+        happyview::spaces::pds_support::space_uri_form(&app.state.db, app.state.db_backend, &pds)
+            .await
+            .unwrap(),
+        happyview::spaces::UriForm::AtSpace
+    );
 }
 
 fn get_as(app: &TestApp, did: &str, path: &str) -> Request<Body> {
@@ -636,7 +783,7 @@ async fn list_spaces_gives_the_space_revision_to_its_owner_only() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|v| v["space"] == json!(space))
+                .find(|v| v["uri"] == json!(space))
                 .cloned()
                 .expect("listed")
         }
@@ -1331,7 +1478,7 @@ async fn a_revocation_through_a_delegation_entry_notifies_the_hosts_of_native_re
 
     let pds = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/xrpc/com.atproto.space.notifyCredentialRevoked"))
+        .and(path("/xrpc/com.atproto.space.notifyCredentialsRevoked"))
         .respond_with(ResponseTemplate::new(200))
         .mount(&pds)
         .await;
@@ -1404,7 +1551,10 @@ async fn a_revocation_through_a_delegation_entry_notifies_the_hosts_of_native_re
         .unwrap();
         claims["jti"].clone()
     };
-    assert_eq!(body["space"], json!(outer));
+    assert_eq!(
+        body["space"],
+        json!(happyview::spaces::UriForm::AtSpace.write(&outer))
+    );
     assert_eq!(body["credentials"], json!([jti]));
     let authorization = received[0]
         .headers
@@ -1566,4 +1716,86 @@ async fn a_removal_below_waits_for_a_member_change_committing_above() {
 
     let (status, body) = get_space_with(&app, &outer, &credential, &key).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A host that implements only the earlier, singular name is sent the
+/// revocation once more under it.
+#[tokio::test]
+#[serial]
+async fn a_revocation_falls_back_to_the_singular_name() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    common::require_db!();
+    let (space, bodies, _app, _pds) = revocations_sent_to(
+        vec![
+            Mock::given(method("POST"))
+                .and(path("/xrpc/com.atproto.space.notifyCredentialRevoked"))
+                .respond_with(ResponseTemplate::new(200)),
+            Mock::given(method("POST"))
+                .and(path("/xrpc/com.atproto.space.notifyCredentialsRevoked"))
+                .respond_with(ResponseTemplate::new(501).set_body_json(
+                    json!({ "error": "MethodNotImplemented", "message": "Method Not Implemented" }),
+                )),
+        ],
+        2,
+    )
+    .await;
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    assert_eq!(bodies[0], bodies[1], "the same revocation under each name");
+    assert_eq!(
+        bodies[1]["space"],
+        json!(happyview::spaces::UriForm::AtSpace.write(&space))
+    );
+}
+
+/// A refusal that only mentions a 404 in its text isn't taken for a method
+/// the host lacks.
+#[tokio::test]
+#[serial]
+async fn a_revocation_is_resent_under_the_singular_only_for_a_missing_method() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    common::require_db!();
+    let (_, bodies, _app, _pds) = revocations_sent_to(
+        vec![
+            Mock::given(method("POST"))
+                .and(path("/xrpc/com.atproto.space.notifyCredentialsRevoked"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(
+                    json!({ "error": "InvalidRequest", "message": "credential list 404 entries long" }),
+                )),
+        ],
+        1,
+    )
+    .await;
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+}
+
+/// A 404, and an error named `XRPCNotSupported`, also mean the plural name
+/// is missing.
+#[tokio::test]
+#[serial]
+async fn a_revocation_falls_back_to_the_singular_name_on_any_missing_method_answer() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    common::require_db!();
+    for missing in [
+        ResponseTemplate::new(404),
+        ResponseTemplate::new(400)
+            .set_body_json(json!({ "error": "XRPCNotSupported", "message": "not supported" })),
+    ] {
+        let (_, bodies, app, _pds) = revocations_sent_to(
+            vec![
+                Mock::given(method("POST"))
+                    .and(path("/xrpc/com.atproto.space.notifyCredentialRevoked"))
+                    .respond_with(ResponseTemplate::new(200)),
+                Mock::given(method("POST"))
+                    .and(path("/xrpc/com.atproto.space.notifyCredentialsRevoked"))
+                    .respond_with(missing),
+            ],
+            2,
+        )
+        .await;
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        drop(app);
+    }
 }

@@ -294,7 +294,7 @@ pub async fn did_doc(plc_url: &str, did: &str) -> happyview::profile::DidDocumen
 /// A `getLatestCommit` answer, with what a syncer needs to authenticate it.
 pub struct FetchedCommit {
     pub json: Value,
-    pub mac_header: Option<reqwest::header::HeaderValue>,
+    pub headers: reqwest::header::HeaderMap,
     pub exchange: Option<happyview::spaces::space_mac::Encapsulation>,
 }
 
@@ -320,18 +320,17 @@ pub async fn fetch_latest_commit(
         .query(&[("space", space_uri), ("repo", repo)])
         .bearer_auth(token);
     if let Some(exchange) = &exchange {
-        req = req.header(
-            space_mac::WANT_MAC_HEADER,
-            space_mac::want_mac_header(&exchange.key_share).unwrap(),
-        );
+        for (name, value) in space_mac::commit_mac_request_headers(exchange).unwrap() {
+            req = req.header(name, value);
+        }
     }
     let resp = req.send().await.expect("getLatestCommit request");
     assert_eq!(resp.status().as_u16(), 200, "getLatestCommit failed");
-    let mac_header = resp.headers().get(space_mac::MAC_HEADER).cloned();
+    let headers = resp.headers().clone();
     let json = resp.json::<Value>().await.expect("commit json")["commit"].clone();
     FetchedCommit {
         json,
-        mac_header,
+        headers,
         exchange,
     }
 }
@@ -347,13 +346,34 @@ pub async fn verified_latest_commit(
 ) -> happyview::spaces::native_client::VerifiedCommit {
     let doc = did_doc(plc_url, repo).await;
     let fetched = fetch_latest_commit(base, token, space_uri, repo, &doc).await;
+    // A host that reads the Nov 12 request (its answer varies on
+    // Accept-Signature) answers in that revision, so the Nov 12 path is what
+    // passes here, not the Oct 29 one beside it.
+    let nov12 = fetched.headers.contains_key("atproto-space-commit");
+    let reads_nov12 = fetched.headers.get_all("vary").iter().any(|v| {
+        v.to_str()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains("accept-signature")
+    });
+    if fetched.json.get("data").is_some() {
+        eprintln!(
+            "{base} answered a commit MAC in the {} revision",
+            if nov12 { "Nov 12" } else { "Oct 29" }
+        );
+        assert!(
+            !reads_nov12 || (nov12 && fetched.headers.contains_key("signature-input")),
+            "a host that reads Accept-Signature answered without a Nov 12 commit MAC: {:?}",
+            fetched.headers
+        );
+    }
     happyview::spaces::native_client::verify_remote_commit(
         &fetched.json,
         space_uri,
         repo,
         &doc,
         fetched.exchange.as_ref(),
-        fetched.mac_header.as_ref(),
+        &fetched.headers,
     )
     .unwrap_or_else(|e| panic!("the host's commit must verify with our own code: {e}"))
 }

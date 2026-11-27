@@ -706,6 +706,17 @@ async fn refuses_a_delegation_token_addressed_to_the_earlier_service() {
 #[tokio::test]
 #[serial]
 async fn the_authority_revokes_a_credential_by_jti() {
+    revokes_by_jti("com.atproto.space.notifyCredentialRevoked").await;
+}
+
+/// The same, under the Nov 12 name, `notifyCredentialsRevoked`.
+#[tokio::test]
+#[serial]
+async fn the_authority_revokes_a_credential_by_jti_under_the_plural_name() {
+    revokes_by_jti("com.atproto.space.notifyCredentialsRevoked").await;
+}
+
+async fn revokes_by_jti(method: &str) {
     common::require_db!();
     let mut app = TestApp::new_with_encryption().await;
     let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
@@ -737,7 +748,7 @@ async fn the_authority_revokes_a_credential_by_jti() {
     let revoke = |auth: String| {
         Request::builder()
             .method("POST")
-            .uri("/xrpc/com.atproto.space.notifyCredentialRevoked")
+            .uri(format!("/xrpc/{method}"))
             .header("content-type", "application/json")
             .header("authorization", auth)
             .header("host", "127.0.0.1:0")
@@ -746,7 +757,7 @@ async fn the_authority_revokes_a_credential_by_jti() {
             ))
             .unwrap()
     };
-    let lxm = Some("com.atproto.space.notifyCredentialRevoked");
+    let lxm = Some(method);
 
     let stranger = app
         .service_auth_jwt_for(&plc_store, "did:plc:stranger", &instance_did, "", lxm)
@@ -1062,7 +1073,8 @@ async fn own_did_space_and_token(app: &TestApp, skey: &str) -> (String, String, 
         .unwrap();
     let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let space = json_of(resp).await["space"].as_str().unwrap().to_string();
+    // `uri`, the `at://` form, which this test takes apart.
+    let space = json_of(resp).await["uri"].as_str().unwrap().to_string();
     let space_did = space
         .trim_start_matches("at://")
         .split('/')

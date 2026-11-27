@@ -10,7 +10,6 @@ use crate::AppState;
 use crate::error::AppError;
 use crate::spaces::commit::{SignedCommit, SpaceVerifyingKey, decode_lex_bytes};
 use crate::spaces::space_mac;
-use atrium_xrpc::http::{HeaderName, HeaderValue};
 
 /// What an oplog entry did to its record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,36 +267,43 @@ pub async fn get_verified_commit(
         crate::profile::resolve_did_document(&state.http, &state.config.plc_url, author_did)
             .await?;
     let exchange = space_mac::author_kem_key(&did_doc)?.map(|key| space_mac::encapsulate(&key));
+    let want = exchange
+        .as_ref()
+        .map(space_mac::commit_mac_request_headers)
+        .transpose()?;
+    let pds = crate::profile::find_service_endpoint(&did_doc, "atproto_pds");
 
-    let params = [
-        ("space", space_uri.to_string()),
-        // `repo`, not `did`: ZDS answers InvalidRequest "Missing repo"
-        // without it.
-        ("repo", author_did.to_string()),
-    ];
-    let request = crate::repo::pds::pds_get_json(
+    // The space named in the form the author's host takes.
+    let (body, headers) = crate::spaces::pds_support::with_space_uri_form(
         state,
-        session,
-        "com.atproto.space.getLatestCommit",
-        &params,
-    );
-    let (body, mac_header) = match &exchange {
-        Some(exchange) => {
-            let want = space_mac::want_mac_header(&exchange.key_share)?;
-            let (body, received) = crate::http_retry::with_header_exchange(
-                (
-                    HeaderName::from_static(space_mac::WANT_MAC_HEADER),
-                    HeaderValue::from_str(&want)
-                        .map_err(|_| AppError::Internal("unsendable MAC request".into()))?,
-                ),
-                HeaderName::from_static(space_mac::MAC_HEADER),
-                request,
-            )
-            .await;
-            (body?, received)
-        }
-        None => (request.await?, None),
-    };
+        pds.as_deref(),
+        space_uri,
+        |space| {
+            let want = want.clone();
+            async move {
+                let params = [
+                    ("space", space),
+                    // `repo`, not `did`: ZDS answers InvalidRequest "Missing
+                    // repo" without it.
+                    ("repo", author_did.to_string()),
+                ];
+                let request = crate::repo::pds::pds_get_json(
+                    state,
+                    session,
+                    "com.atproto.space.getLatestCommit",
+                    &params,
+                );
+                match want {
+                    Some(want) => {
+                        let (body, received) = crate::http_retry::with_headers(want, request).await;
+                        Ok((body?, received))
+                    }
+                    None => Ok((request.await?, axum::http::HeaderMap::new())),
+                }
+            }
+        },
+    )
+    .await?;
 
     let commit = body
         .get("commit")
@@ -308,7 +314,7 @@ pub async fn get_verified_commit(
         author_did,
         &did_doc,
         exchange.as_ref(),
-        mac_header.as_ref(),
+        &headers,
     )
 }
 
@@ -319,12 +325,24 @@ pub fn verify_remote_commit(
     author_did: &str,
     did_doc: &crate::profile::DidDocument,
     exchange: Option<&space_mac::Encapsulation>,
-    mac_header: Option<&HeaderValue>,
+    headers: &axum::http::HeaderMap,
 ) -> Result<VerifiedCommit, AppError> {
     if commit.get("data").is_none() {
         let commit = parse_signed_commit(commit)?;
         let key = signing_key_from_doc(did_doc, author_did)?;
-        crate::spaces::commit::verify_commit(&commit, space_uri, author_did, &key)?;
+        // Signed commits predate `at:space/`, so their signature covers the
+        // `at://…/space/…` form; a host that signs over `at:space/` is read
+        // too.
+        let legacy = crate::spaces::canonical_uri(space_uri);
+        crate::spaces::commit::verify_commit(&commit, &legacy, author_did, &key).or_else(|e| {
+            crate::spaces::commit::verify_commit(
+                &commit,
+                &crate::spaces::UriForm::AtSpace.write(&legacy),
+                author_did,
+                &key,
+            )
+            .map_err(|_| e)
+        })?;
         return Ok(VerifiedCommit::Signed(commit));
     }
 
@@ -335,23 +353,7 @@ pub fn verify_remote_commit(
              cannot be authenticated"
         ))
     })?;
-    let mac_header = mac_header.ok_or_else(|| {
-        AppError::Auth(format!(
-            "the repo host sent a commit without the {} header it was asked for",
-            space_mac::MAC_HEADER
-        ))
-    })?;
-    let mac =
-        space_mac::parse_mac_header(mac_header.to_str().map_err(|_| {
-            AppError::Auth(format!("{} header is not text", space_mac::MAC_HEADER))
-        })?)?;
-    space_mac::verify_commit(
-        &commit,
-        space_uri,
-        author_did,
-        &exchange.shared_secret,
-        &mac,
-    )?;
+    space_mac::verify_commit_response(&commit, space_uri, author_did, exchange, headers)?;
     Ok(VerifiedCommit::Mac(commit))
 }
 
@@ -363,11 +365,65 @@ pub async fn list_repo_ops(
     author_did: &str,
     since: Option<&str>,
 ) -> Result<Vec<RepoOp>, AppError> {
-    collect_repo_ops(space_uri, author_did, since, |params| async move {
-        crate::repo::pds::pds_get_json(state, session, "com.atproto.space.listRepoOps", &params)
-            .await
+    // The host the session calls.
+    let pds = atrium_xrpc::XrpcClient::base_uri(session);
+    collect_repo_ops_in_host_form(
+        state,
+        Some(&pds),
+        space_uri,
+        author_did,
+        since,
+        |params| async move {
+            crate::repo::pds::pds_get_json(state, session, "com.atproto.space.listRepoOps", &params)
+                .await
+        },
+    )
+    .await
+}
+
+/// [`collect_repo_ops`], naming the space in the form `pds` takes. The first
+/// page settles the form; later pages are sent in it, so a failure partway
+/// through neither restarts the listing nor changes what is remembered.
+pub(crate) async fn collect_repo_ops_in_host_form<F, Fut>(
+    state: &AppState,
+    pds: Option<&str>,
+    space_uri: &str,
+    author_did: &str,
+    since: Option<&str>,
+    fetch: F,
+) -> Result<Vec<RepoOp>, AppError>
+where
+    F: Fn(Vec<(&'static str, String)>) -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, AppError>>,
+{
+    let chosen: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let (chosen, fetch) = (&chosen, &fetch);
+    collect_repo_ops(space_uri, author_did, since, |mut params| async move {
+        let settled = chosen.lock().expect("not poisoned").clone();
+        if let Some(space) = settled {
+            set_param(&mut params, "space", space);
+            return fetch(params).await;
+        }
+        crate::spaces::pds_support::with_space_uri_form(state, pds, space_uri, |space| {
+            let mut params = params.clone();
+            set_param(&mut params, "space", space.clone());
+            async move {
+                let page = fetch(params).await?;
+                *chosen.lock().expect("not poisoned") = Some(space);
+                Ok(page)
+            }
+        })
+        .await
     })
     .await
+}
+
+fn set_param(params: &mut [(&'static str, String)], name: &str, value: String) {
+    for (k, v) in params.iter_mut() {
+        if *k == name {
+            *v = value.clone();
+        }
+    }
 }
 
 /// The last op for each record, in log order.
@@ -598,7 +654,7 @@ mod tests {
     fn mac_commit(
         exchange: &space_mac::Encapsulation,
         data: [u8; 32],
-    ) -> (serde_json::Value, HeaderValue) {
+    ) -> (serde_json::Value, axum::http::HeaderMap) {
         use base64::Engine;
         let commit = space_mac::Commit {
             ver: 1,
@@ -619,7 +675,12 @@ mod tests {
             "rev": "3krev",
             "data": encode_lex_bytes(&data),
         });
-        (json, HeaderValue::from_str(&header).unwrap())
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            space_mac::MAC_HEADER,
+            axum::http::HeaderValue::from_str(&header).unwrap(),
+        );
+        (json, headers)
     }
 
     #[test]
@@ -628,12 +689,73 @@ mod tests {
         let exchange = space_mac::encapsulate(&space_mac::author_kem_key(&doc).unwrap().unwrap());
         let (json, header) = mac_commit(&exchange, [0xAA; 32]);
 
-        let commit =
-            verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&exchange), Some(&header))
-                .expect("a MACed commit must verify");
+        let commit = verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&exchange), &header)
+            .expect("a MACed commit must verify");
         assert!(matches!(commit, VerifiedCommit::Mac(_)));
         assert_eq!(commit.hash(), &[0xAA; 32]);
         assert_eq!(commit.rev(), "3krev");
+    }
+
+    /// A 0016 commit, and the headers a Nov 12 host would answer it with.
+    fn nov12_commit(
+        exchange: &space_mac::Encapsulation,
+        data: [u8; 32],
+    ) -> (serde_json::Value, axum::http::HeaderMap) {
+        use base64::Engine;
+        use hmac::{KeyInit, Mac};
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let covered = format!(
+            r#"ver=1, repo="{AUTHOR}", space="{SPACE}", rev="3krev", data=:{}:"#,
+            b64(&data)
+        );
+        let params = format!(
+            r#"("atproto-space-commit";sf);keyid="{}";tag="atproto-space-commit""#,
+            exchange.key_share
+        );
+        let base =
+            format!("\"atproto-space-commit\";sf: {covered}\n\"@signature-params\": {params}");
+        let mut mac =
+            <hmac::Hmac<sha2::Sha256> as KeyInit>::new_from_slice(&exchange.export_secret).unwrap();
+        mac.update(base.as_bytes());
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in [
+            ("atproto-space-commit", covered),
+            ("signature-input", format!("mac={params}")),
+            (
+                "signature",
+                format!("mac=:{}:", b64(&mac.finalize().into_bytes())),
+            ),
+        ] {
+            headers.insert(name, axum::http::HeaderValue::from_str(&value).unwrap());
+        }
+        let json = serde_json::json!({
+            "ver": 1,
+            "repo": AUTHOR,
+            "space": SPACE,
+            "rev": "3krev",
+            "data": encode_lex_bytes(&data),
+        });
+        (json, headers)
+    }
+
+    #[test]
+    fn a_0016_commit_verifies_by_its_nov12_mac() {
+        let doc = did_doc(None, Some(&kem_key()));
+        let exchange = space_mac::encapsulate(&space_mac::author_kem_key(&doc).unwrap().unwrap());
+        let (json, headers) = nov12_commit(&exchange, [0xAA; 32]);
+        let commit = verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&exchange), &headers)
+            .expect("a Nov 12 MAC must verify");
+        assert!(matches!(commit, VerifiedCommit::Mac(_)));
+        assert_eq!(commit.hash(), &[0xAA; 32]);
+
+        // Under another exchange, or for another body, it doesn't.
+        let other = space_mac::encapsulate(&space_mac::author_kem_key(&doc).unwrap().unwrap());
+        assert!(verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&other), &headers).is_err());
+        let (tampered, _) = nov12_commit(&exchange, [0xAB; 32]);
+        assert!(
+            verify_remote_commit(&tampered, SPACE, AUTHOR, &doc, Some(&exchange), &headers)
+                .is_err()
+        );
     }
 
     #[test]
@@ -643,24 +765,25 @@ mod tests {
         let (json, header) = mac_commit(&exchange, [0xAA; 32]);
 
         // The host ignored the request for a MAC.
-        assert!(verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&exchange), None).is_err());
-        // The author publishes no KEM key, so no MAC could be asked for.
         assert!(
             verify_remote_commit(
                 &json,
                 SPACE,
                 AUTHOR,
-                &did_doc(None, None),
-                None,
-                Some(&header)
+                &doc,
+                Some(&exchange),
+                &axum::http::HeaderMap::new()
             )
             .is_err()
         );
+        // The author publishes no KEM key, so no MAC could be asked for.
+        assert!(
+            verify_remote_commit(&json, SPACE, AUTHOR, &did_doc(None, None), None, &header)
+                .is_err()
+        );
         // A MAC computed under another exchange is not this request's.
         let other = space_mac::encapsulate(&space_mac::author_kem_key(&doc).unwrap().unwrap());
-        assert!(
-            verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&other), Some(&header)).is_err()
-        );
+        assert!(verify_remote_commit(&json, SPACE, AUTHOR, &doc, Some(&other), &header).is_err());
     }
 
     #[test]
@@ -678,11 +801,111 @@ mod tests {
             AUTHOR,
             &doc,
             Some(&exchange),
-            None,
+            &axum::http::HeaderMap::new(),
         )
         .expect("a signed commit must verify");
         assert!(matches!(commit, VerifiedCommit::Signed(_)));
         assert_eq!(commit.hash(), &[0xAA; 32]);
+    }
+
+    /// A host's pages of one op each, `pages` long, naming the space as
+    /// asked; `answer` decides each request from its space and cursor.
+    async fn listed(
+        state: &AppState,
+        answer: impl Fn(&str, Option<&str>) -> Result<serde_json::Value, AppError>,
+    ) -> (Result<Vec<RepoOp>, AppError>, Vec<(String, Option<String>)>) {
+        let sent = std::sync::Mutex::new(Vec::new());
+        let result = collect_repo_ops_in_host_form(
+            state,
+            Some("https://pds.example"),
+            SPACE,
+            AUTHOR,
+            None,
+            |params| {
+                let get = |name: &str| {
+                    params
+                        .iter()
+                        .find(|(k, _)| *k == name)
+                        .map(|(_, v)| v.clone())
+                };
+                let (space, cursor) = (get("space").unwrap(), get("cursor"));
+                sent.lock().unwrap().push((space.clone(), cursor.clone()));
+                let answer = answer(&space, cursor.as_deref());
+                async move { answer }
+            },
+        )
+        .await;
+        (result, sent.into_inner().unwrap())
+    }
+
+    fn page(rev: &str, cursor: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "ops": [{
+                "rev": rev, "collection": "com.example.note", "rkey": rev,
+                "cid": "bafyreidefdycgbfy3oglcb6ism3eqhyp5llsrpzxjsuac2gsy4mtrtx244",
+                "prev": null, "value": { "text": rev },
+            }],
+            "cursor": cursor,
+        })
+    }
+
+    fn form_refusal() -> AppError {
+        AppError::Internal(
+            "PDS query failed: InvalidRequest: Invalid space-ref format: space".into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_listing_settles_its_form_on_the_first_page() {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let new = crate::spaces::UriForm::AtSpace.write(SPACE);
+        // A host taking only the earlier form: page 1 falls back, page 2 is
+        // sent in the form page 1 settled.
+        let (result, sent) = listed(&state, |space, cursor| {
+            if space.starts_with("at:space/") {
+                return Err(form_refusal());
+            }
+            Ok(match cursor {
+                None => page("3a", Some("c1")),
+                Some(_) => page("3b", None),
+            })
+        })
+        .await;
+        assert_eq!(result.unwrap().len(), 2);
+        assert_eq!(
+            sent,
+            [
+                (new.clone(), None),
+                (SPACE.to_string(), None),
+                (SPACE.to_string(), Some("c1".into()))
+            ]
+        );
+
+        // A host that took page 1 in at:space/ and fails page 2 on something
+        // naming the space: the listing fails, without starting over in the
+        // earlier form or remembering it.
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let (result, sent) = listed(&state, |_, cursor| match cursor {
+            None => Ok(page("3a", Some("c1"))),
+            Some(_) => Err(form_refusal()),
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(sent, [(new.clone(), None), (new, Some("c1".into()))]);
+        assert_eq!(
+            crate::spaces::pds_support::space_uri_form(
+                &state.db,
+                state.db_backend,
+                "https://pds.example"
+            )
+            .await
+            .unwrap(),
+            crate::spaces::UriForm::AtSpace
+        );
     }
 
     #[test]

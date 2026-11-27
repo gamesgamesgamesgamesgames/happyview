@@ -100,6 +100,15 @@ struct NotifyWriteInput {
     collection: Option<String>,
     rkey: Option<String>,
     cid: Option<String>,
+    /// zds 0.9's `notifyRepoUpdate` carried the repo's state as `latest`,
+    /// before the Nov 12 text flattened it into `repoRev` and `data`.
+    latest: Option<LatestRepoState>,
+}
+
+#[derive(Deserialize)]
+struct LatestRepoState {
+    rev: String,
+    data: LexBytes,
 }
 
 /// A lexicon `bytes` value, encoded in JSON as `{"$bytes": "<base64>"}`.
@@ -603,11 +612,20 @@ pub(crate) fn protocol_method_table() -> Vec<(String, MethodRouter<AppState>)> {
         (format!("{PROTO_NS}.space.listBlobs"), get(list_blobs)),
         (format!("{PROTO_NS}.space.notifyWrite"), post(notify_write)),
         (
+            format!("{PROTO_NS}.space.notifyRepoUpdate"),
+            post(notify_repo_update),
+        ),
+        (
             format!("{PROTO_NS}.space.notifySpaceDeleted"),
             post(notify_space_deleted),
         ),
         (
             format!("{PROTO_NS}.space.notifyCredentialRevoked"),
+            post(notify_credential_revoked),
+        ),
+        // The Nov 12 name; the singular is the earlier one.
+        (
+            format!("{PROTO_NS}.space.notifyCredentialsRevoked"),
             post(notify_credential_revoked),
         ),
         (format!("{PROTO_NS}.space.getBlob"), get(get_space_blob)),
@@ -940,7 +958,7 @@ async fn list_spaces(
         .map(|v| {
             let mut view = serde_json::json!({
                 "uri": v.uri,
-                "space": v.uri,
+                "space": crate::spaces::NEW_SPACE_FORM.write(&v.uri),
                 "isOwner": v.is_owner,
             });
             if let Some(rev) = v.repo_rev {
@@ -1025,6 +1043,7 @@ async fn create_record(
         input.record,
     )
     .await?;
+    let uri = crate::spaces::UriForm::of(&input.space).write(&uri);
     let mut response = Json(serde_json::json!({ "uri": uri, "cid": cid })).into_response();
     *response.status_mut() = StatusCode::CREATED;
     Ok(response)
@@ -1061,6 +1080,7 @@ async fn put_record(
         input.swap_record,
     )
     .await?;
+    let uri = crate::spaces::UriForm::of(&input.space).write(&uri);
     let mut response = Json(serde_json::json!({ "uri": uri, "cid": cid })).into_response();
     *response.status_mut() = StatusCode::CREATED;
     Ok(response)
@@ -1249,7 +1269,7 @@ async fn apply_writes(
                     old_cid: None,
                 });
                 results.push(serde_json::json!({
-                    "uri": record_uri,
+                    "uri": crate::spaces::UriForm::of(&input.space).write(&record_uri),
                     "cid": cid,
                 }));
             }
@@ -1308,7 +1328,7 @@ async fn apply_writes(
                     old_cid,
                 });
                 results.push(serde_json::json!({
-                    "uri": record_uri,
+                    "uri": crate::spaces::UriForm::of(&input.space).write(&record_uri),
                     "cid": cid,
                 }));
             }
@@ -1596,7 +1616,7 @@ async fn get_record(
     .await?;
 
     Ok(Json(serde_json::json!({
-        "uri": record.uri,
+        "uri": crate::spaces::UriForm::of(&query.space).write(&record.uri),
         "cid": record.cid,
         "value": record.record,
     })))
@@ -1844,7 +1864,9 @@ async fn get_delegation_token(
     let space_host = format!("{}#atproto_pds", space.did);
     let delegation_claims = crate::spaces::credential::DelegationTokenClaims {
         iss: did,
-        sub: space_uri,
+        // In the form the request named the space in; any form is accepted
+        // back (`same_space_uri`).
+        sub: crate::spaces::UriForm::of(&params.space).write(&space_uri),
         aud: space_host,
         iat: now,
         exp,
@@ -1952,8 +1974,12 @@ async fn get_latest_commit(
     // RepoNotFound, since their commit is required.
     let repo_state = db::read_repo_state(&mut conn, state.db_backend, &space.id, &repo).await?;
     if named == RepoParam::Repo {
-        let commit = lexicon_commit(repo_state.as_ref(), &repo, &space_ref(&space))?
-            .ok_or_else(|| repo_not_found(&repo))?;
+        let commit = lexicon_commit(
+            repo_state.as_ref(),
+            &repo,
+            &crate::spaces::UriForm::of(&params.space).write(&space_ref(&space)),
+        )?
+        .ok_or_else(|| repo_not_found(&repo))?;
         return Ok(Json(serde_json::json!({
             "commit": lexicon_commit_json(&commit),
             // HappyView's earlier field, the same as commit.rev.
@@ -2009,8 +2035,12 @@ async fn get_repo(
         // The lexicons' archive: STAR, with the commit as its metadata.
         let repo_state = db::read_repo_state(&mut conn, state.db_backend, &space.id, &repo).await?;
         drop(conn);
-        let commit = lexicon_commit(repo_state.as_ref(), &repo, &space_ref(&space))?
-            .ok_or_else(|| repo_not_found(&repo))?;
+        let commit = lexicon_commit(
+            repo_state.as_ref(),
+            &repo,
+            &crate::spaces::UriForm::of(&params.space).write(&space_ref(&space)),
+        )?
+        .ok_or_else(|| repo_not_found(&repo))?;
         let records =
             db::list_all_space_records(&state.db, state.db_backend, &space.id, &repo).await?;
         let star = crate::spaces::star_repo::serialize_repo(&commit, &records)?;
@@ -2132,7 +2162,7 @@ async fn list_repo_ops(
     let exclude_values = params.exclude_values.unwrap_or(false);
     // The lexicons' commit is required, so a repo never written is not found.
     // Checked before listing: there is nothing to list.
-    let canonical = space_ref(&space);
+    let canonical = crate::spaces::UriForm::of(&params.space).write(&space_ref(&space));
     if named == RepoParam::Repo {
         let mut conn = state
             .db
@@ -2499,6 +2529,94 @@ async fn list_blobs(
     Ok(Json(body))
 }
 
+/// `notifyRepoUpdate`: a repo host's report that a repo advanced, in the
+/// shape the Nov 12 text gives `notifyWrite`'s spec form. Handled as that
+/// form is (including `FutureRev`), with the checks the method adds: every
+/// field is required, and each sender is limited.
+async fn notify_repo_update(
+    State(state): State<AppState>,
+    claims: XrpcClaims,
+    Json(mut input): Json<NotifyWriteInput>,
+) -> Result<axum::response::Response, AppError> {
+    // Sent by repo hosts, as service auth signed as the repo that advanced:
+    // no session or other account reports a repo's state.
+    let sender = claims
+        .service_auth
+        .as_ref()
+        .map(|sa| sa.did.clone())
+        .ok_or_else(|| AppError::Auth("service auth from the repo is required".into()))?;
+    state.repo_update_senders.charge(&sender)?;
+    let invalid = |message: &str| AppError::XrpcError {
+        status: StatusCode::BAD_REQUEST,
+        code: "InvalidRequest",
+        message: message.into(),
+    };
+    // zds 0.9's state, taken whole, and only when the flat fields are absent.
+    if let Some(latest) = input.latest.take()
+        && input.repo_rev.is_none()
+        && input.data.is_none()
+    {
+        input.repo_rev = Some(latest.rev);
+        input.data = Some(latest.data);
+    }
+    // A report names the repo's state, not a record, so nothing is announced
+    // from it.
+    input.did = None;
+    input.collection = None;
+    input.rkey = None;
+    input.cid = None;
+    let (Some(repo), Some(rev), Some(_)) = (&input.repo, &input.repo_rev, &input.data) else {
+        return Err(invalid("repo, repoRev and data are required"));
+    };
+    if *repo != sender {
+        return Err(AppError::Forbidden(
+            "a repo update is reported by the repo it names".into(),
+        ));
+    }
+    crate::spaces::writers::check_rev_not_future(rev)?;
+    // Addressed to the space's authority (or its space host). A token
+    // addressed to this instance stands for that only when the instance is
+    // the authority.
+    let audience = claims
+        .service_auth
+        .as_ref()
+        .and_then(|sa| sa.space_audience.clone());
+    let instance_fragment = claims
+        .service_auth
+        .as_ref()
+        .map(|sa| sa.aud_fragment.as_str())
+        .unwrap_or_default();
+    if audience.is_none()
+        && !matches!(
+            instance_fragment,
+            "" | "#atproto_pds" | "#atproto_space_host"
+        )
+    {
+        return Err(AppError::Forbidden(
+            "service auth must be addressed to the space's host".into(),
+        ));
+    }
+    if audience.is_none()
+        && let Ok(space) = service::resolve_space(&state, &input.space).await
+    {
+        let instance = crate::auth::service_auth::instance_did(
+            &state.db,
+            state.db_backend,
+            &state.config.public_url,
+        )
+        .await
+        .ok();
+        if instance.as_deref() != Some(space.authority_did.as_str()) {
+            return Err(AppError::Forbidden(
+                "service auth must be addressed to the space's authority".into(),
+            ));
+        }
+    }
+    notify_write(State(state), claims, Json(input))
+        .await
+        .map(IntoResponse::into_response)
+}
+
 async fn notify_write(
     State(state): State<AppState>,
     claims: XrpcClaims,
@@ -2596,7 +2714,8 @@ async fn notify_write(
                 &state,
                 &space.id,
                 notifications::RepoUpdate {
-                    space_uri: input.space.clone(),
+                    // Named as HappyView names the space in its own notices.
+                    space_uri: space_ref(&space),
                     repo: writer.clone(),
                     rev: rev.clone(),
                     hash,
@@ -2864,6 +2983,7 @@ async fn get_space_credential(
         &space.authority_did,
         Some(credential_key),
         generation.signing_kid(),
+        crate::spaces::UriForm::of(&input.space),
     )
     .await
     .map_err(|e| match e {
@@ -3020,7 +3140,7 @@ async fn verify_delegation(
         .await
         .map_err(|e| invalid(e.to_string()))?,
     };
-    if claims.sub != space_uri {
+    if !crate::spaces::same_space_uri(&claims.sub, space_uri) {
         return Err(invalid("delegation token is for a different space".into()));
     }
     if !db::consume_delegation_token(

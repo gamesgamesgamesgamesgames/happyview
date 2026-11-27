@@ -340,7 +340,7 @@ async fn target_id(
     backend: DatabaseBackend,
     reference: &str,
 ) -> Result<Option<String>, AppError> {
-    if reference.starts_with("at://") || reference.starts_with("ats://") {
+    if crate::spaces::is_space_reference(reference) {
         let Ok(uri) = SpaceUri::parse(reference) else {
             return Ok(None);
         };
@@ -415,7 +415,7 @@ pub async fn delegation_target(
     backend: DatabaseBackend,
     reference: &str,
 ) -> Result<Option<Space>, AppError> {
-    if reference.starts_with("at://") || reference.starts_with("ats://") {
+    if crate::spaces::is_space_reference(reference) {
         let uri = SpaceUri::parse(reference)?;
         db::get_space_by_address(pool, backend, &uri.did, &uri.type_nsid, &uri.skey).await
     } else {

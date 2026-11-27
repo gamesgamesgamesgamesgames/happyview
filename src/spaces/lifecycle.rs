@@ -70,10 +70,11 @@ pub(crate) fn space_uri(space: &Space) -> String {
 
 /// A space's reference under both names it has had: `uri` (Oct 29) and
 /// `space` (Nov 12). The lexicons' objects are open, so each generation's
-/// client reads its own and ignores the other.
-pub(crate) fn space_ref_body(space: &Space) -> serde_json::Value {
+/// client reads its own and ignores the other. `uri` keeps the `at://` form
+/// its clients read; `space` is in `form`.
+pub(crate) fn space_ref_body(space: &Space, form: crate::spaces::UriForm) -> serde_json::Value {
     let uri = space_uri(space);
-    serde_json::json!({ "uri": uri, "space": uri })
+    serde_json::json!({ "uri": uri, "space": form.write(&uri) })
 }
 
 async fn resolve(state: &AppState, space: &str) -> Result<Space, AppError> {
@@ -164,7 +165,8 @@ async fn create_space(
         },
         e => e,
     })?;
-    Ok(Json(space_ref_body(&space)))
+    // Nothing in the request names a space to copy the form from.
+    Ok(Json(space_ref_body(&space, crate::spaces::NEW_SPACE_FORM)))
 }
 
 /// Replace a space's policy wholesale. A policy of another `$type` migrates
@@ -201,7 +203,7 @@ async fn get_space(
     let space = resolve(&state, &query.space).await?;
     authorize_reader(&state, &claims, &space).await?;
     let policy = SpacePolicy::of(&space)?;
-    let mut body = space_ref_body(&space);
+    let mut body = space_ref_body(&space, crate::spaces::UriForm::of(&query.space));
     body["policy"] = serde_json::to_value(policy)
         .map_err(|e| AppError::Internal(format!("failed to encode policy: {e}")))?;
     Ok(Json(body))
@@ -301,8 +303,15 @@ mod tests {
         )
         .await
         .map(|Json(body)| {
-            assert_eq!(body["uri"], body["space"], "both names carry the reference");
-            body["space"].as_str().unwrap().to_string()
+            // Both names carry the reference: `uri` in the `at://` form its
+            // clients read, `space` in the current form.
+            let uri = body["uri"].as_str().unwrap().to_string();
+            assert_eq!(
+                body["space"],
+                serde_json::json!(crate::spaces::NEW_SPACE_FORM.write(&uri)),
+                "{body}"
+            );
+            uri
         })
     }
 

@@ -83,7 +83,8 @@ async fn create(app: &TestApp, owner: &str, policy: Value) -> String {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    body["space"].as_str().unwrap().to_string()
+    // `uri`, the `at://` form these tests name spaces in and store.
+    body["uri"].as_str().unwrap().to_string()
 }
 
 async fn put_members(app: &TestApp, owner: &str, space: &str, members: Value) {
