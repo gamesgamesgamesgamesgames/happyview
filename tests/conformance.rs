@@ -47,106 +47,131 @@ fn scripted_feeder(
     Feeder::new(send.clone(), send)
 }
 
-#[tokio::test]
-async fn the_default_pipeline_conforms() {
-    conformance::run(|| async {
-        let (source, events) = ScriptedSource::new();
-        let feeder = scripted_feeder(source.clone(), events, |event| {
-            Box::pin(async move { event })
-        });
-        (
-            Providers {
-                source,
-                storage: None,
-            },
-            feeder,
-        )
-    })
-    .await;
+/// Run `test` on a runtime whose threads have large stacks. A conformance run
+/// walks every case through the whole pipeline and its hooks, which in an
+/// unoptimized build comes close to the default 2 MiB a thread gets, and
+/// over it on some platforms.
+fn on_a_large_stack<F>(test: impl FnOnce() -> F + Send + 'static)
+where
+    F: std::future::Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .thread_stack_size(16 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("a runtime")
+                .block_on(test())
+        })
+        .expect("a test thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
-#[tokio::test]
-async fn a_claiming_external_store_conforms() {
-    conformance::run(|| async {
-        let (source, events) = ScriptedSource::new();
-        let storage = Arc::new(FakeStorage::applying(&[COLLECTION]).await);
-        let store = storage.clone();
-        // The store writes its own row, then its feed delivers the event.
-        let feeder = scripted_feeder(source.clone(), events, move |event: RecordEvent| {
-            let store = store.clone();
-            Box::pin(async move {
-                match &event.body {
-                    Some(body) if event.action != happyview_provider::Action::Delete => {
-                        store
-                            .store(PreparedRecord {
-                                did: event.key.did.clone(),
-                                collection: event.key.collection.clone(),
-                                rkey: event.key.rkey.clone(),
-                                record_json: body.to_string(),
-                                cid: event.cid.clone().unwrap_or_default(),
-                                rev: event.rev.clone(),
-                            })
-                            .await
-                    }
-                    _ => store.unstore(&event.key.uri()).await,
-                }
-                RecordEvent {
-                    stored: true,
-                    ..event
-                }
-            })
-        });
-        // The store's outage: its reads fail as a closed pool's do.
-        let outage = storage.clone();
-        let feeder = feeder.make_unavailable(move || {
-            let outage = outage.clone();
-            async move { outage.down.store(true, Ordering::SeqCst) }
-        });
-        // What the served view cannot show: nothing of the claimed
-        // collection was written locally, and core spoke to the store.
-        let seen = storage.clone();
-        let feeder = feeder.after_each(move |case, app| {
-            let seen = seen.clone();
-            Box::pin(async move {
-                assert_eq!(
-                    app.local_rows(COLLECTION).await,
-                    0,
-                    "a claimed collection has no local rows"
-                );
-                let deltas = seen.deltas();
-                assert!(!deltas.is_empty(), "core wrote no delta to the store");
-                if case == "delete_removes_the_record" {
-                    // The store removed the record itself; what core owes it
-                    // is clearing this instance's delta, whatever rev it
-                    // was made at.
-                    let deleted: Vec<_> = deltas
-                        .iter()
-                        .filter(|(key, _, _)| key.rkey == "a1")
-                        .collect();
-                    let (_, first, created_at) = deleted.first().expect("a1 had a delta");
-                    let (_, last, deleted_at) = deleted.last().unwrap();
-                    assert_eq!(*first, Delta::Proceed, "a1's create proceeded");
-                    assert!(created_at.is_some(), "a1's create is at its rev");
-                    assert_eq!(*last, Delta::Proceed, "the delete cleared a1's delta");
-                    assert_eq!(
-                        *deleted_at, None,
-                        "the delete's clear is unconditional: {deleted:?}"
-                    );
-                    assert_eq!(
-                        seen.overlay(&deleted[0].0.uri()),
-                        None,
-                        "no delta on a1 outlived it"
-                    );
-                }
-            })
-        });
-        (
-            Providers {
-                source,
-                storage: Some(storage),
-            },
-            feeder,
-        )
+#[test]
+fn the_default_pipeline_conforms() {
+    on_a_large_stack(|| {
+        conformance::run(|| async {
+            let (source, events) = ScriptedSource::new();
+            let feeder = scripted_feeder(source.clone(), events, |event| {
+                Box::pin(async move { event })
+            });
+            (
+                Providers {
+                    source,
+                    storage: None,
+                },
+                feeder,
+            )
+        })
     })
-    .await;
+}
+
+#[test]
+fn a_claiming_external_store_conforms() {
+    on_a_large_stack(|| {
+        conformance::run(|| async {
+            let (source, events) = ScriptedSource::new();
+            let storage = Arc::new(FakeStorage::applying(&[COLLECTION]).await);
+            let store = storage.clone();
+            // The store writes its own row, then its feed delivers the event.
+            let feeder = scripted_feeder(source.clone(), events, move |event: RecordEvent| {
+                let store = store.clone();
+                Box::pin(async move {
+                    match &event.body {
+                        Some(body) if event.action != happyview_provider::Action::Delete => {
+                            store
+                                .store(PreparedRecord {
+                                    did: event.key.did.clone(),
+                                    collection: event.key.collection.clone(),
+                                    rkey: event.key.rkey.clone(),
+                                    record_json: body.to_string(),
+                                    cid: event.cid.clone().unwrap_or_default(),
+                                    rev: event.rev.clone(),
+                                })
+                                .await
+                        }
+                        _ => store.unstore(&event.key.uri()).await,
+                    }
+                    RecordEvent {
+                        stored: true,
+                        ..event
+                    }
+                })
+            });
+            // The store's outage: its reads fail as a closed pool's do.
+            let outage = storage.clone();
+            let feeder = feeder.make_unavailable(move || {
+                let outage = outage.clone();
+                async move { outage.down.store(true, Ordering::SeqCst) }
+            });
+            // What the served view cannot show: nothing of the claimed
+            // collection was written locally, and core spoke to the store.
+            let seen = storage.clone();
+            let feeder = feeder.after_each(move |case, app| {
+                let seen = seen.clone();
+                Box::pin(async move {
+                    assert_eq!(
+                        app.local_rows(COLLECTION).await,
+                        0,
+                        "a claimed collection has no local rows"
+                    );
+                    let deltas = seen.deltas();
+                    assert!(!deltas.is_empty(), "core wrote no delta to the store");
+                    if case == "delete_removes_the_record" {
+                        // The store removed the record itself; what core owes it
+                        // is clearing this instance's delta, whatever rev it
+                        // was made at.
+                        let deleted: Vec<_> = deltas
+                            .iter()
+                            .filter(|(key, _, _)| key.rkey == "a1")
+                            .collect();
+                        let (_, first, created_at) = deleted.first().expect("a1 had a delta");
+                        let (_, last, deleted_at) = deleted.last().unwrap();
+                        assert_eq!(*first, Delta::Proceed, "a1's create proceeded");
+                        assert!(created_at.is_some(), "a1's create is at its rev");
+                        assert_eq!(*last, Delta::Proceed, "the delete cleared a1's delta");
+                        assert_eq!(
+                            *deleted_at, None,
+                            "the delete's clear is unconditional: {deleted:?}"
+                        );
+                        assert_eq!(
+                            seen.overlay(&deleted[0].0.uri()),
+                            None,
+                            "no delta on a1 outlived it"
+                        );
+                    }
+                })
+            });
+            (
+                Providers {
+                    source,
+                    storage: Some(storage),
+                },
+                feeder,
+            )
+        })
+    })
 }
