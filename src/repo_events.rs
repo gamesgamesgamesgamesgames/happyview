@@ -78,9 +78,9 @@ impl HeldCache {
 }
 
 /// Whether this instance indexes `did`: it holds records for it, or did
-/// until HappyView purged them for a suspension, takedown, deletion or
-/// resync (a DID tombstone, or the state recorded here), so a reinstated or
-/// resynced account still counts. A lookup that fails reads as not indexed,
+/// until HappyView purged them for a suspension, takedown or resync (the
+/// state recorded here, which is only ever written for an indexed account),
+/// so a reinstated or resynced account still counts. A lookup that fails reads as not indexed,
 /// so a database hiccup never fires a script for a stranger.
 async fn indexed(state: &AppState, cache: &Arc<HeldCache>, did: &str) -> bool {
     let now = chrono::Utc::now().timestamp();
@@ -97,22 +97,22 @@ async fn indexed(state: &AppState, cache: &Arc<HeldCache>, did: &str) -> bool {
     held
 }
 
-/// Whether HappyView keeps a DID tombstone or recorded state for `did`.
+/// Whether HappyView keeps recorded state for `did`. Not DID tombstones: a
+/// deletion or takedown of any account on the network writes one.
 async fn known_here(state: &AppState, did: &str) -> bool {
     let row: Result<Option<(String,)>, _> = crate::db::query_as(&adapt_sql(
-        "SELECT did FROM happyview_did_tombstones WHERE did = ? \
-         UNION ALL SELECT did FROM happyview_repo_event_state WHERE did = ? LIMIT 1",
+        "SELECT did FROM happyview_repo_event_state WHERE did = ?",
         state.db_backend,
     ))
-    .bind(did)
     .bind(did)
     .fetch_optional(&state.db)
     .await;
     matches!(row, Ok(Some(_)))
 }
 
-/// Forget an account's recorded state, once it is deleted.
-async fn forget(state: &AppState, did: &str) {
+/// Forget an account's recorded state and the events it ran, once it is
+/// deleted (after the purge succeeds) or no longer indexed.
+pub async fn forget(state: &AppState, did: &str) {
     for table in ["happyview_repo_event_state", "happyview_repo_event_fired"] {
         let result = crate::db::query(&adapt_sql(
             &format!("DELETE FROM {table} WHERE did = ?"),
@@ -157,15 +157,15 @@ async fn fresh(state: &AppState, did: &str, family: &str, event_key: Option<Stri
     }
 }
 
-/// The key an event is known by: its sequence number, or its time.
-fn event_key(seq: Option<i64>, time_us: Option<i64>) -> Option<String> {
+/// The key an event is known by: its sequence number. An event without one
+/// isn't deduplicated, since a time isn't unique.
+fn event_key(seq: Option<i64>) -> Option<String> {
     seq.map(|s| format!("seq:{s}"))
-        .or_else(|| time_us.map(|t| format!("time:{t}")))
 }
 
-/// Drop recorded state, at most hourly, for accounts not heard of in 30 days
-/// that this instance no longer holds records for.
-async fn sweep(state: &AppState) {
+/// Drop recorded state, at most hourly and off the event path, for accounts
+/// not heard of in 30 days that this instance no longer holds records for.
+fn sweep(state: &AppState) {
     use std::sync::atomic::Ordering;
     let now = chrono::Utc::now().timestamp();
     let cache = &state.repo_event_held;
@@ -178,10 +178,15 @@ async fn sweep(state: &AppState) {
     {
         return;
     }
+    let state = state.clone();
+    tokio::spawn(async move { sweep_now(&state).await });
+}
+
+async fn sweep_now(state: &AppState) {
     let cutoff =
         (chrono::Utc::now() - chrono::Duration::seconds(STATE_RETENTION_SECONDS)).to_rfc3339();
     let stale: Vec<(String,)> = crate::db::query_as(&adapt_sql(
-        "SELECT did FROM happyview_repo_event_state WHERE updated_at < ? LIMIT ?",
+        "SELECT did FROM happyview_repo_event_state WHERE updated_at < ? ORDER BY updated_at LIMIT ?",
         state.db_backend,
     ))
     .bind(&cutoff)
@@ -195,10 +200,29 @@ async fn sweep(state: &AppState) {
             .holds_network_records(&did, None)
             .await
             .unwrap_or(true);
-        if !held {
+        if held {
+            // Still indexed: looked at again in 30 days, not every sweep.
+            let _ = crate::db::query(&adapt_sql(
+                "UPDATE happyview_repo_event_state SET updated_at = ? WHERE did = ?",
+                state.db_backend,
+            ))
+            .bind(crate::db::now_rfc3339())
+            .bind(&did)
+            .execute(&state.db)
+            .await;
+        } else {
             forget(state, &did).await;
         }
     }
+    // Events recorded for accounts with no state (only `repo:sync` ran).
+    let _ = crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_repo_event_fired WHERE fired_at < ? \
+         AND did NOT IN (SELECT did FROM happyview_repo_event_state)",
+        state.db_backend,
+    ))
+    .bind(&cutoff)
+    .execute(&state.db)
+    .await;
 }
 
 /// What HappyView last recorded of an account.
@@ -293,6 +317,7 @@ pub async fn identity(
     did: &str,
     handle: Option<&str>,
     as_of_us: Option<i64>,
+    seq: Option<i64>,
     time_us: Option<i64>,
 ) {
     if as_of_us.is_some() {
@@ -302,8 +327,8 @@ pub async fn identity(
     if triggers.is_empty() || !indexed(state, &state.repo_event_held, did).await {
         return;
     }
-    sweep(state).await;
-    if !fresh(state, did, "identity", event_key(None, time_us)).await {
+    sweep(state);
+    if !fresh(state, did, "identity", event_key(seq)).await {
         return;
     }
     let previous = known(state, did).await;
@@ -355,8 +380,8 @@ pub async fn account(
     if bound(state, all).await.is_empty() || !indexed(state, &state.repo_event_held, did).await {
         return;
     }
-    sweep(state).await;
-    if !fresh(state, did, "account", event_key(seq, time_us)).await {
+    sweep(state);
+    if !fresh(state, did, "account", event_key(seq)).await {
         return;
     }
     let previous = known(state, did).await;
@@ -375,11 +400,6 @@ pub async fn account(
         .collect();
     let triggers = bound(state, fired).await;
     run(state, &triggers, did, &input).await;
-    // A deleted account's handle and status aren't kept once its scripts
-    // have heard of the deletion.
-    if !active && status == Some("deleted") {
-        forget(state, did).await;
-    }
 }
 
 /// A `#sync` event: the `repo:sync` scripts it will run, decided before
@@ -410,7 +430,7 @@ pub async fn sync(
     seq: Option<i64>,
     time_us: Option<i64>,
 ) {
-    if triggers.is_empty() || !fresh(state, did, "repo", event_key(seq, time_us)).await {
+    if triggers.is_empty() || !fresh(state, did, "repo", event_key(seq)).await {
         return;
     }
     let input = json!({ "did": did, "rev": rev, "time": time_of(time_us) });
@@ -510,10 +530,9 @@ mod tests {
     }
 
     #[test]
-    fn an_event_is_known_by_its_seq_or_its_time() {
-        assert_eq!(event_key(Some(5), Some(9)).as_deref(), Some("seq:5"));
-        assert_eq!(event_key(None, Some(9)).as_deref(), Some("time:9"));
-        assert_eq!(event_key(None, None), None);
+    fn an_event_is_known_by_its_seq_alone() {
+        assert_eq!(event_key(Some(5)).as_deref(), Some("seq:5"));
+        assert_eq!(event_key(None), None);
     }
 
     #[test]

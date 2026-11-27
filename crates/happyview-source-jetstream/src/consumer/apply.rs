@@ -214,6 +214,7 @@ pub(crate) fn marker_event(
             did,
             handle,
             as_of_us,
+            seq,
             time_us,
         },
         EventKind::Commit(_) => unreachable!("a commit is not a marker"),

@@ -129,14 +129,15 @@ fn triggers(runs: &[(String, Value, Value)]) -> Vec<&str> {
     runs.iter().map(|(t, _, _)| t.as_str()).collect()
 }
 
-/// An identity event at `T` plus a fresh microsecond, since identity events
-/// are known by their time.
+/// An identity event, every one at `T` with a fresh sequence number: two
+/// events at one time are two events.
 fn identity(did: &str, handle: Option<&str>, as_of_us: Option<i64>) -> SourceEvent {
     SourceEvent::Identity {
         did: did.to_string(),
         handle: handle.map(str::to_string),
         as_of_us,
-        time_us: Some(T + next_seq()),
+        seq: Some(next_seq()),
+        time_us: Some(T),
     }
 }
 
@@ -180,7 +181,7 @@ async fn identity_update_names_the_handle_and_the_one_before() {
             "did": DID,
             "handle": "a.test",
             "previous_handle": null,
-            "time": runs[0].1["time"],
+            "time": "2023-11-14T22:13:20.000000Z",
         })
     );
     assert_eq!(runs[1].1["previous_handle"], json!("a.test"));
@@ -211,6 +212,10 @@ async fn nothing_fires_for_a_repo_not_indexed_or_a_replayed_marker() {
     for event in [
         identity(STRANGER, Some("x.test"), None),
         account(STRANGER, false, Some("deactivated"), None),
+        // A takedown of any account writes a DID tombstone; that doesn't
+        // make the account one this instance indexes.
+        account(STRANGER, false, Some("takendown"), None),
+        account(STRANGER, true, None, None),
         SourceEvent::Sync {
             did: STRANGER.to_string(),
             rev: None,
@@ -490,4 +495,18 @@ async fn an_event_applied_again_runs_its_scripts_once() {
         triggers(&runs(&app).await),
         ["account:update", "account:deactivate"]
     );
+}
+
+/// A deletion applied again runs `account:delete` once.
+#[tokio::test]
+#[serial]
+async fn a_deletion_applied_again_runs_account_delete_once() {
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    install(&app, "account:delete", "host:log_input").await;
+    let event = account(DID, false, Some("deleted"), None);
+    let _ = happyview::ingest::apply(&app.state, event.clone()).await;
+    let _ = happyview::ingest::apply(&app.state, event).await;
+    assert_eq!(triggers(&runs(&app).await), ["account:delete"]);
 }

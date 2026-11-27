@@ -179,12 +179,14 @@ pub(crate) async fn apply_in(state: &AppState, event: SourceEvent) -> Applied {
             did,
             handle,
             as_of_us,
+            seq,
             time_us,
         } => {
             // HappyView caches no DID documents or handles, so there is
             // nothing to refresh; an `identity:update` script hears of it.
             tracing::debug!(did, ?handle, "jetstream identity event");
-            crate::repo_events::identity(state, &did, handle.as_deref(), as_of_us, time_us).await;
+            crate::repo_events::identity(state, &did, handle.as_deref(), as_of_us, seq, time_us)
+                .await;
             Applied::ok(IngestOutcome::Skipped)
         }
     }
@@ -1426,6 +1428,11 @@ async fn account_event(
     };
     // A purge changes what is held, so the next event looks again.
     state.repo_event_held.forget(did);
+    // A deleted account's recorded state goes once it is purged; a purge
+    // that failed is applied again, and must not run account:delete twice.
+    if as_of_us.is_none() && !active && status == Some("deleted") && applied.error.is_none() {
+        crate::repo_events::forget(state, did).await;
+    }
     applied
 }
 

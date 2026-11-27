@@ -106,6 +106,8 @@ pub enum SourceEvent {
         handle: Option<String>,
         /// As for `Account`: set for a marker replayed from the archive.
         as_of_us: Option<i64>,
+        /// As for `Account`.
+        seq: Option<i64>,
         /// When the source saw the event; `None` means now.
         time_us: Option<i64>,
     },
