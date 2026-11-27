@@ -21,6 +21,12 @@ const STRANGER: &str = "did:plc:notindexed";
 /// 2023-11-14T22:13:20Z.
 const T: i64 = 1_700_000_000_000_000;
 
+/// A fresh sequence number for each event, as the network gives.
+fn next_seq() -> i64 {
+    static SEQ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 macro_rules! require_fixture {
     () => {
         if !echo_interpreter::is_built() {
@@ -123,12 +129,14 @@ fn triggers(runs: &[(String, Value, Value)]) -> Vec<&str> {
     runs.iter().map(|(t, _, _)| t.as_str()).collect()
 }
 
+/// An identity event at `T` plus a fresh microsecond, since identity events
+/// are known by their time.
 fn identity(did: &str, handle: Option<&str>, as_of_us: Option<i64>) -> SourceEvent {
     SourceEvent::Identity {
         did: did.to_string(),
         handle: handle.map(str::to_string),
         as_of_us,
-        time_us: Some(T),
+        time_us: Some(T + next_seq()),
     }
 }
 
@@ -138,7 +146,7 @@ fn account(did: &str, active: bool, status: Option<&str>, as_of_us: Option<i64>)
         active,
         status: status.map(str::to_string),
         as_of_us,
-        seq: Some(1),
+        seq: Some(next_seq()),
         time_us: Some(T),
         collections: None,
     }
@@ -172,7 +180,7 @@ async fn identity_update_names_the_handle_and_the_one_before() {
             "did": DID,
             "handle": "a.test",
             "previous_handle": null,
-            "time": "2023-11-14T22:13:20.000000Z",
+            "time": runs[0].1["time"],
         })
     );
     assert_eq!(runs[1].1["previous_handle"], json!("a.test"));
@@ -183,7 +191,9 @@ async fn identity_update_names_the_handle_and_the_one_before() {
         "an event without a handle"
     );
     assert_eq!(runs[2].1["previous_handle"], json!("b.test"));
-    assert_eq!(runs[0].2, json!(DID), "the event's DID is the caller");
+    // The run carries no caller, so nothing it calls acts with the account's
+    // authority: every host write takes its account from the caller.
+    assert_eq!(runs[0].2, json!(null), "no caller: {:?}", runs[0]);
 }
 
 #[tokio::test]
@@ -461,4 +471,23 @@ async fn a_failed_run_is_dead_lettered_and_retried_with_its_input() {
     .await
     .unwrap();
     assert_eq!(unresolved, 0);
+}
+
+/// An event applied again, as ingest does after a failed write, runs nothing
+/// twice: it carries the sequence number it had.
+#[tokio::test]
+#[serial]
+async fn an_event_applied_again_runs_its_scripts_once() {
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    install(&app, "account:update", "host:log_input").await;
+    install(&app, "account:deactivate", "host:log_input").await;
+    let event = account(DID, false, Some("deactivated"), None);
+    let _ = happyview::ingest::apply(&app.state, event.clone()).await;
+    let _ = happyview::ingest::apply(&app.state, event).await;
+    assert_eq!(
+        triggers(&runs(&app).await),
+        ["account:update", "account:deactivate"]
+    );
 }

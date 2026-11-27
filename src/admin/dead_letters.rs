@@ -1002,7 +1002,7 @@ async fn retry_repo_event(state: &AppState, dl: &DeadLetterRow) -> Result<(), Ap
         .resolve_in(&project, &trigger)
         .await
         .ok_or_else(|| AppError::NotFound(format!("no script bound for {}", dl.script_ref)))?;
-    match crate::lua::scripts::run_repo_event_once(state, &resolved, &dl.did, &dl.payload).await {
+    match crate::lua::scripts::run_repo_event_once(state, &resolved, &dl.payload).await {
         Ok(()) => mark_resolved(state, &dl.id, dl.source).await,
         Err(e) => {
             update_error(state, &dl.id, dl.source, &e).await?;

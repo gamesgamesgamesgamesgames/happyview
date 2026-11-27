@@ -509,8 +509,9 @@ pub async fn has_repo_event_script(state: &AppState, trigger: &ParsedTrigger) ->
 }
 
 /// Run the script bound to `trigger` (`identity:*`, `account:*` or
-/// `repo:*`), if any, with `input`, as the account `did`. Retried and
-/// dead-lettered as record scripts are; what it returns is ignored.
+/// `repo:*`), if any, with `input`, for the account `did`, with no caller.
+/// Retried and dead-lettered as record scripts are; what it returns is
+/// ignored.
 pub async fn run_repo_event_script(
     state: &AppState,
     trigger: &ParsedTrigger,
@@ -554,7 +555,7 @@ pub async fn run_repo_event_script(
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(1 << (attempt - 1))).await;
         }
-        match run_repo_event_once(state, &resolved, did, input).await {
+        match run_repo_event_once(state, &resolved, input).await {
             Ok(()) => {
                 if state.verbose_event_logging.load(Ordering::Relaxed) {
                     log_event(
@@ -596,7 +597,6 @@ pub async fn run_repo_event_script(
 pub async fn run_repo_event_once(
     state: &AppState,
     script: &ResolvedScript,
-    did: &str,
     input: &Value,
 ) -> Result<(), String> {
     let trigger = trigger_of(script, None)?;
@@ -608,9 +608,10 @@ pub async fn run_repo_event_once(
             language: &script.script_type,
             source: &script.body,
             input,
-            // The account the event is about; the event carries none of its
-            // credentials.
-            caller_did: Some(did),
+            // No caller: the event is the network's report about an account,
+            // not a request from it, so it carries none of the account's
+            // authority. The account is `input.did`.
+            caller_did: None,
             has_pds_auth: false,
             method: None,
             collection: None,

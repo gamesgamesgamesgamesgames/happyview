@@ -8,3 +8,13 @@ CREATE TABLE IF NOT EXISTS happyview_repo_event_state (
     status TEXT,
     updated_at TEXT NOT NULL
 );
+
+-- The last event each script family ran for, per account, so an event
+-- applied again (after a failed write) doesn't run its scripts twice.
+CREATE TABLE IF NOT EXISTS happyview_repo_event_fired (
+    did TEXT NOT NULL,
+    family TEXT NOT NULL,
+    event_key TEXT NOT NULL,
+    fired_at TEXT NOT NULL,
+    PRIMARY KEY (did, family)
+);

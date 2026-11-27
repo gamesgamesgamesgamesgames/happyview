@@ -35,7 +35,15 @@ const HELD_CAPACITY: usize = 100_000;
 #[derive(Default)]
 pub struct HeldCache {
     held: DashMap<String, (bool, i64)>,
+    /// When recorded state was last swept for accounts no longer indexed.
+    last_sweep: std::sync::atomic::AtomicI64,
 }
+
+/// How long recorded state is kept for an account no longer indexed.
+const STATE_RETENTION_SECONDS: i64 = 30 * 86_400;
+/// How often recorded state is swept, and how many rows one sweep reads.
+const SWEEP_EVERY_SECONDS: i64 = 3600;
+const SWEEP_BATCH: i64 = 500;
 
 impl HeldCache {
     fn get(&self, did: &str, now: i64) -> Option<bool> {
@@ -48,6 +56,12 @@ impl HeldCache {
     /// Forget what was found for `did`, so the next event looks again.
     pub fn forget(&self, did: &str) {
         self.held.remove(did);
+    }
+
+    /// A record of `did`'s was stored: a remembered "not indexed" is wrong
+    /// now. Cheap when nothing is remembered, as is usual.
+    pub fn stored(&self, did: &str) {
+        self.held.remove_if(did, |_, (held, _)| !*held);
     }
 
     fn put(&self, did: &str, held: bool, now: i64) {
@@ -99,15 +113,91 @@ async fn known_here(state: &AppState, did: &str) -> bool {
 
 /// Forget an account's recorded state, once it is deleted.
 async fn forget(state: &AppState, did: &str) {
+    for table in ["happyview_repo_event_state", "happyview_repo_event_fired"] {
+        let result = crate::db::query(&adapt_sql(
+            &format!("DELETE FROM {table} WHERE did = ?"),
+            state.db_backend,
+        ))
+        .bind(did)
+        .execute(&state.db)
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(did, error = %e, "could not forget an account's state");
+        }
+    }
+}
+
+/// Whether `event_key` is new for `did`'s `family` of scripts, recording it
+/// if so. An event applied again (ingest retries one whose write failed)
+/// carries the key it had, and runs nothing twice. An event with no key is
+/// always new.
+async fn fresh(state: &AppState, did: &str, family: &str, event_key: Option<String>) -> bool {
+    let Some(key) = event_key else {
+        return true;
+    };
     let result = crate::db::query(&adapt_sql(
-        "DELETE FROM happyview_repo_event_state WHERE did = ?",
+        "INSERT INTO happyview_repo_event_fired (did, family, event_key, fired_at) VALUES (?, ?, ?, ?) \
+         ON CONFLICT (did, family) DO UPDATE SET event_key = excluded.event_key, fired_at = excluded.fired_at \
+         WHERE happyview_repo_event_fired.event_key <> excluded.event_key",
         state.db_backend,
     ))
     .bind(did)
+    .bind(family)
+    .bind(&key)
+    .bind(crate::db::now_rfc3339())
     .execute(&state.db)
     .await;
-    if let Err(e) = result {
-        tracing::warn!(did, error = %e, "could not forget a deleted account's state");
+    match result {
+        Ok(done) => done.rows_affected() > 0,
+        // Running twice is better than not at all.
+        Err(e) => {
+            tracing::warn!(did, error = %e, "could not record an account event");
+            true
+        }
+    }
+}
+
+/// The key an event is known by: its sequence number, or its time.
+fn event_key(seq: Option<i64>, time_us: Option<i64>) -> Option<String> {
+    seq.map(|s| format!("seq:{s}"))
+        .or_else(|| time_us.map(|t| format!("time:{t}")))
+}
+
+/// Drop recorded state, at most hourly, for accounts not heard of in 30 days
+/// that this instance no longer holds records for.
+async fn sweep(state: &AppState) {
+    use std::sync::atomic::Ordering;
+    let now = chrono::Utc::now().timestamp();
+    let cache = &state.repo_event_held;
+    let last = cache.last_sweep.load(Ordering::Relaxed);
+    if now - last < SWEEP_EVERY_SECONDS
+        || cache
+            .last_sweep
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let cutoff =
+        (chrono::Utc::now() - chrono::Duration::seconds(STATE_RETENTION_SECONDS)).to_rfc3339();
+    let stale: Vec<(String,)> = crate::db::query_as(&adapt_sql(
+        "SELECT did FROM happyview_repo_event_state WHERE updated_at < ? LIMIT ?",
+        state.db_backend,
+    ))
+    .bind(&cutoff)
+    .bind(SWEEP_BATCH)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    for (did,) in stale {
+        let held = state
+            .records
+            .holds_network_records(&did, None)
+            .await
+            .unwrap_or(true);
+        if !held {
+            forget(state, &did).await;
+        }
     }
 }
 
@@ -212,6 +302,10 @@ pub async fn identity(
     if triggers.is_empty() || !indexed(state, &state.repo_event_held, did).await {
         return;
     }
+    sweep(state).await;
+    if !fresh(state, did, "identity", event_key(None, time_us)).await {
+        return;
+    }
     let previous = known(state, did).await;
     remember_handle(state, did, handle).await;
     let input = json!({
@@ -249,6 +343,7 @@ pub async fn account(
     active: bool,
     status: Option<&str>,
     as_of_us: Option<i64>,
+    seq: Option<i64>,
     time_us: Option<i64>,
 ) {
     if as_of_us.is_some() {
@@ -258,6 +353,10 @@ pub async fn account(
         .map(|e| trigger(TriggerKind::Account, e))
         .to_vec();
     if bound(state, all).await.is_empty() || !indexed(state, &state.repo_event_held, did).await {
+        return;
+    }
+    sweep(state).await;
+    if !fresh(state, did, "account", event_key(seq, time_us)).await {
         return;
     }
     let previous = known(state, did).await;
@@ -308,9 +407,10 @@ pub async fn sync(
     triggers: &[ParsedTrigger],
     did: &str,
     rev: Option<&str>,
+    seq: Option<i64>,
     time_us: Option<i64>,
 ) {
-    if triggers.is_empty() {
+    if triggers.is_empty() || !fresh(state, did, "repo", event_key(seq, time_us)).await {
         return;
     }
     let input = json!({ "did": did, "rev": rev, "time": time_of(time_us) });
@@ -407,6 +507,13 @@ mod tests {
         cache.put("did:plc:new", true, 0);
         assert!(cache.held.len() <= HELD_CAPACITY);
         assert_eq!(cache.get("did:plc:new", 1), Some(true));
+    }
+
+    #[test]
+    fn an_event_is_known_by_its_seq_or_its_time() {
+        assert_eq!(event_key(Some(5), Some(9)).as_deref(), Some("seq:5"));
+        assert_eq!(event_key(None, Some(9)).as_deref(), Some("time:9"));
+        assert_eq!(event_key(None, None), None);
     }
 
     #[test]

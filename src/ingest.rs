@@ -147,7 +147,7 @@ pub(crate) async fn apply_in(state: &AppState, event: SourceEvent) -> Applied {
             did,
             rev,
             as_of_us,
-            seq: _,
+            seq,
             time_us,
             collections,
         } => {
@@ -169,8 +169,9 @@ pub(crate) async fn apply_in(state: &AppState, event: SourceEvent) -> Applied {
             // After the resync purge, so a `repo:sync` script sees the repo
             // as HappyView now holds it; not when the purge failed, since
             // the event is applied again.
+            state.repo_event_held.forget(&did);
             if applied.error.is_none() {
-                crate::repo_events::sync(state, &scripts, &did, rev.as_deref(), time_us).await;
+                crate::repo_events::sync(state, &scripts, &did, rev.as_deref(), seq, time_us).await;
             }
             applied
         }
@@ -542,6 +543,9 @@ async fn write_run(
         }
     };
     let mut changed: HashSet<String> = changed.into_iter().map(|c| c.uri).collect();
+    for (_, ev, _, _) in run.iter() {
+        state.repo_event_held.stored(&ev.key.did);
+    }
 
     // A URI written twice in the run counts as changed once, on its last
     // copy (the one stored).
@@ -893,6 +897,7 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
             timer.finish(&state.metrics, Some((stages::WRITE, started.elapsed())));
             match written {
                 Ok(changed) => {
+                    state.repo_event_held.stored(&ev.key.did);
                     // An identical redelivery changed nothing, so there is
                     // nothing new to log or to fetch labels for.
                     if changed {
@@ -1375,13 +1380,13 @@ async fn account_event(
 ) -> Applied {
     // Before HappyView acts on it, so an `account:delete` script runs while
     // the account's records are still held.
-    crate::repo_events::account(state, did, active, status, as_of_us, time_us).await;
+    crate::repo_events::account(state, did, active, status, as_of_us, seq, time_us).await;
     let before = as_of_us.map(tid);
     // The DID tombstone's rev: when the source saw the event.
     let witnessed = time_us
         .or(as_of_us)
         .unwrap_or_else(|| chrono::Utc::now().timestamp_micros());
-    match (active, status) {
+    let applied = match (active, status) {
         (false, Some("deleted")) => {
             crate::db::with_change_reason(
                 Some("purge:deleted".to_string()),
@@ -1418,7 +1423,10 @@ async fn account_event(
         (false, _) if as_of_us.is_some() => Applied::ok(IngestOutcome::Matched),
         (false, status) => account_inactive(state, did, status).await,
         (true, _) => account_active(state, did, before.as_deref()).await,
-    }
+    };
+    // A purge changes what is held, so the next event looks again.
+    state.repo_event_held.forget(did);
+    applied
 }
 
 /// `active=false` with `status=deleted`, `takendown` or `suspended` (Decision

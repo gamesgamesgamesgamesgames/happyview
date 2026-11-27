@@ -146,6 +146,20 @@ pub async fn build_snapshot_with(
                     ));
                     continue;
                 }
+                // Files named after an event in these directories were modules
+                // before they named scripts: say so where one is a script now.
+                if trigger.kind.is_repo_event() {
+                    let path = file.rel_path().to_string_lossy().replace('\\', "/");
+                    if env.current.generation == 0 || env.current.modules.contains_key(&path) {
+                        diagnostics.push(Diagnostic::warning(
+                            file.rel_path(),
+                            format!(
+                                "runs as the {id} script; a file named after an event in src/identity/, \
+                                 src/account/ or src/repo/ is a script, so rename it if it is a module"
+                            ),
+                        ));
+                    }
+                }
                 handled_by.insert(id, file.rel_path());
                 pending.push(Pending {
                     file,
@@ -667,6 +681,32 @@ mod tests {
             "{:?}",
             report.changes
         );
+    }
+
+    /// A file in `src/account/` named after an event is a script, and the
+    /// build says so: on the first build, and when the build it replaces had
+    /// the file as a module.
+    #[tokio::test]
+    async fn an_event_named_file_is_said_to_run_as_its_script() {
+        let Some(state) = env().await else { return };
+        let root = project(&[
+            ("src/account/delete.echo", "echo"),
+            ("src/account/helpers.echo", "no-handle"),
+        ]);
+        let report = build_snapshot(&state, root.path(), BuildOptions::default())
+            .await
+            .unwrap_or_else(|d| panic!("{:#?}", shown(&d)));
+        assert!(report.snapshot.scripts.contains_key("account:delete"));
+        assert!(
+            report
+                .snapshot
+                .modules
+                .contains_key("src/account/helpers.echo")
+        );
+        let warned = shown(&report.warnings);
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].contains("src/account/delete.echo"), "{warned:?}");
+        assert!(warned[0].contains("account:delete"), "{warned:?}");
     }
 
     #[tokio::test]
