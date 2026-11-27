@@ -173,8 +173,11 @@ fn panic_response(panic: Box<dyn std::any::Any + Send + 'static>) -> axum::respo
     AppError::Internal(format!("handler panicked: {detail}")).into_response()
 }
 
-/// Allowed request methods, shared by both CORS policies.
-const CORS_ALLOW_METHODS: &str = "GET, POST, DELETE, OPTIONS";
+/// Allowed request methods, shared by both CORS policies: every method a route
+/// answers. The admin API updates with PUT and PATCH (scripts, users, API
+/// clients, service entries, publishing rules), and a browser client such as
+/// the HappyProto dashboard can only send them if the preflight allows them.
+const CORS_ALLOW_METHODS: &str = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
 
 /// Headers a credentialed (first-party, cookie-bearing) request may send.
 const CORS_ALLOW_HEADERS_CREDENTIALED: &str = "content-type, authorization, cookie, x-client-key, x-client-secret, dpop, \
@@ -579,6 +582,25 @@ async fn get_profile(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cors_allows_every_method_the_admin_routes_use() {
+        let allowed: Vec<&str> = super::CORS_ALLOW_METHODS.split(", ").collect();
+        let routes = include_str!("admin/mod.rs");
+        for (method, call) in [
+            ("PUT", "put("),
+            ("PATCH", "patch("),
+            ("DELETE", "delete("),
+            ("POST", "post("),
+        ] {
+            if routes.contains(call) {
+                assert!(
+                    allowed.contains(&method),
+                    "the admin API uses {method}, so CORS must allow it"
+                );
+            }
+        }
+    }
+
     use super::apply_jwks_uri;
 
     #[test]
