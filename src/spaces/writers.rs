@@ -25,6 +25,21 @@ pub enum Recorded {
     Stale,
 }
 
+/// Refuse a `rev` that isn't a TID, or that points further ahead than clock
+/// skew allows (`FutureRev`).
+pub fn check_rev_not_future(rev: &str) -> Result<(), AppError> {
+    let rev_micros = tid::tid_to_unix_microseconds(rev)
+        .ok_or_else(|| AppError::BadRequest("rev is not a TID".into()))?;
+    if rev_micros > chrono::Utc::now().timestamp_micros() + MAX_REV_CLOCK_SKEW_MICROS {
+        return Err(AppError::XrpcError {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            code: "FutureRev",
+            message: "the repo revision exceeds the permitted clock skew".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Record a repo's new `rev` and `hash`, advancing the space revision.
 ///
 /// Runs on the caller's connection so a local write records its writer in the
@@ -37,15 +52,7 @@ pub async fn record(
     rev: &str,
     hash: &[u8],
 ) -> Result<Recorded, AppError> {
-    let rev_micros = tid::tid_to_unix_microseconds(rev)
-        .ok_or_else(|| AppError::BadRequest("rev is not a TID".into()))?;
-    if rev_micros > chrono::Utc::now().timestamp_micros() + MAX_REV_CLOCK_SKEW_MICROS {
-        return Err(AppError::XrpcError {
-            status: axum::http::StatusCode::BAD_REQUEST,
-            code: "FutureRev",
-            message: "the repo revision exceeds the permitted clock skew".into(),
-        });
-    }
+    check_rev_not_future(rev)?;
 
     // Postgres runs concurrent writers in parallel, so hold the space row to
     // hand out space revisions one at a time. SQLite already serializes writers.

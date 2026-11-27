@@ -129,6 +129,8 @@ pub struct AppState {
     pub collections_tx: watch::Sender<Vec<String>>,
     pub labeler_subscriptions_tx: watch::Sender<()>,
     pub labeler_subscription_cache: Arc<labeler::SubscriptionCache>,
+    /// Each `notifyRepoUpdate` sender's calls in its current hour and day.
+    pub repo_update_senders: Arc<spaces::notifications::SenderLimits>,
     pub rate_limiter: Arc<RateLimiter>,
     pub oauth: Arc<auth::OAuthClientRegistry>,
     pub oauth_state_store: DbStateStore,
