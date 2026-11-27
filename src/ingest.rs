@@ -131,7 +131,9 @@ pub(crate) async fn apply_in(state: &AppState, event: SourceEvent) -> Applied {
             time_us,
             collections,
         } => {
-            account_event(
+            // Boxed: an account event's purge and scripts make a large
+            // future, and `apply_in` runs on every event.
+            Box::pin(account_event(
                 state,
                 &did,
                 active,
@@ -140,7 +142,7 @@ pub(crate) async fn apply_in(state: &AppState, event: SourceEvent) -> Applied {
                 seq,
                 time_us,
                 collections.as_deref(),
-            )
+            ))
             .await
         }
         SourceEvent::Sync {
@@ -160,18 +162,26 @@ pub(crate) async fn apply_in(state: &AppState, event: SourceEvent) -> Applied {
             let before = as_of_us.map(|t| rev.clone().unwrap_or_else(|| tid(t)));
             // Whether a `repo:sync` script runs is decided before the purge
             // removes the records that make the account count as indexed.
-            let scripts = crate::repo_events::sync_triggers(state, &did, as_of_us).await;
-            let applied = crate::db::with_change_reason(
+            let scripts = Box::pin(crate::repo_events::sync_triggers(state, &did, as_of_us)).await;
+            let applied = Box::pin(crate::db::with_change_reason(
                 Some("purge:sync".to_string()),
                 repo_resynced(state, &did, rev.as_deref(), &tracked, before.as_deref()),
-            )
+            ))
             .await;
             // After the resync purge, so a `repo:sync` script sees the repo
             // as HappyView now holds it; not when the purge failed, since
             // the event is applied again.
             state.repo_event_held.forget(&did);
             if applied.error.is_none() {
-                crate::repo_events::sync(state, &scripts, &did, rev.as_deref(), seq, time_us).await;
+                Box::pin(crate::repo_events::sync(
+                    state,
+                    &scripts,
+                    &did,
+                    rev.as_deref(),
+                    seq,
+                    time_us,
+                ))
+                .await;
             }
             applied
         }
@@ -185,8 +195,17 @@ pub(crate) async fn apply_in(state: &AppState, event: SourceEvent) -> Applied {
             // HappyView caches no DID documents or handles, so there is
             // nothing to refresh; an `identity:update` script hears of it.
             tracing::debug!(did, ?handle, "jetstream identity event");
-            crate::repo_events::identity(state, &did, handle.as_deref(), as_of_us, seq, time_us)
-                .await;
+            // Boxed, here and below, so the scripts' futures don't grow
+            // ingest's own, which the stack holds.
+            Box::pin(crate::repo_events::identity(
+                state,
+                &did,
+                handle.as_deref(),
+                as_of_us,
+                seq,
+                time_us,
+            ))
+            .await;
             Applied::ok(IngestOutcome::Skipped)
         }
     }
@@ -1408,7 +1427,10 @@ async fn account_event(
 ) -> Applied {
     // Before HappyView acts on it, so an `account:delete` script runs while
     // the account's records are still held.
-    crate::repo_events::account(state, did, active, status, as_of_us, seq, time_us).await;
+    Box::pin(crate::repo_events::account(
+        state, did, active, status, as_of_us, seq, time_us,
+    ))
+    .await;
     let before = as_of_us.map(tid);
     // The DID tombstone's rev: when the source saw the event.
     let witnessed = time_us
@@ -1457,7 +1479,7 @@ async fn account_event(
     // A deleted account's recorded state goes once it is purged; a purge
     // that failed is applied again, and must not run account:delete twice.
     if as_of_us.is_none() && !active && status == Some("deleted") && applied.error.is_none() {
-        crate::repo_events::forget(state, did).await;
+        Box::pin(crate::repo_events::forget(state, did)).await;
     }
     applied
 }
