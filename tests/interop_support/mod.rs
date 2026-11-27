@@ -377,3 +377,86 @@ pub async fn verified_latest_commit(
     )
     .unwrap_or_else(|e| panic!("the host's commit must verify with our own code: {e}"))
 }
+
+/// How `base` answers an unauthenticated call to `method`: `Some(true)` when
+/// it is refused as unauthenticated (the method is there), `Some(false)` when
+/// it is answered as a method the host lacks, and `None` otherwise.
+async fn served(base: &str, method: &str) -> Option<bool> {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/xrpc/{method}"))
+        .json(&json!({}))
+        .send()
+        .await
+        .ok()?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    match status {
+        401 | 403 => Some(true),
+        404 | 501 => Some(false),
+        // The reference PDS answers a method it lacks with InvalidRequest
+        // "No service configured for ...".
+        400 if body.contains("No service configured") || body.contains("MethodNotImplemented") => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+/// Which generation of space methods a host serves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Generation {
+    /// `simplespace.*`, as the pinned images do.
+    Simplespace,
+    /// The Nov 12 `space.createSpace` and `memberspace.*`, and no simplespace.
+    Nov12,
+}
+
+/// The generation `base` serves. Panics when the host's answers fit neither,
+/// so a check doesn't skip silently on a host it can't place.
+pub async fn generation(base: &str) -> Generation {
+    let simplespace = served(base, "com.atproto.simplespace.createSpace").await;
+    let nov12 = served(base, "com.atproto.memberspace.putMembers").await;
+    match (simplespace, nov12) {
+        (Some(true), _) => Generation::Simplespace,
+        (Some(false), Some(true)) => Generation::Nov12,
+        other => {
+            panic!("{base} serves neither generation of space methods recognisably: {other:?}")
+        }
+    }
+}
+
+/// A space of type `com.example.forum` under `skey`, created the way the host
+/// takes: `simplespace.createSpace` with `simplespace` as its body when the
+/// host serves it, as the harness always did, and otherwise the Nov 12
+/// `space.createSpace` with a member-list policy. The space's URI, in the
+/// form the host answers with.
+pub async fn create_space(base: &str, token: &str, skey: &str, simplespace: Value) -> String {
+    let (method, body) = if generation(base).await == Generation::Simplespace {
+        ("com.atproto.simplespace.createSpace", simplespace)
+    } else {
+        (
+            "com.atproto.space.createSpace",
+            json!({
+                "spaceType": "com.example.forum",
+                "skey": skey,
+                "policy": { "$type": "com.atproto.memberspace.policy" },
+            }),
+        )
+    };
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/xrpc/{method}"))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{method}: {e}"));
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    assert!(status < 300, "{method} failed ({status}): {body}");
+    // `space` is the Nov 12 name; `uri` the earlier one.
+    body["space"]
+        .as_str()
+        .or_else(|| body["uri"].as_str())
+        .unwrap_or_else(|| panic!("{method} named no space: {body}"))
+        .to_string()
+}

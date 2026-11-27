@@ -101,23 +101,23 @@ impl Account {
         post(Some(&self.token), method, body).await
     }
 
-    /// A space in the pre-split shape this server takes: one `policy`.
+    /// A member-list space, created the way the host takes: for the
+    /// simplespace generation, in the pre-split shape with one `policy`.
     async fn new_space(&self) -> String {
-        let (status, body) = self
-            .post(
-                "com.atproto.simplespace.createSpace",
-                json!({
-                    // `spaceType` and `type` to handle backwards compat.
-                    "spaceType": "com.example.forum",
-                    "type": "com.example.forum",
-                    "skey": "self",
-                    "policy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
-                    "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
-                }),
-            )
-            .await;
-        assert!(status < 300, "createSpace failed ({status}): {body}");
-        body["uri"].as_str().expect("space uri").to_string()
+        interop_support::create_space(
+            PDS,
+            &self.token,
+            "self",
+            json!({
+                // `spaceType` and `type` to handle backwards compat.
+                "spaceType": "com.example.forum",
+                "type": "com.example.forum",
+                "skey": "self",
+                "policy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
+                "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
+            }),
+        )
+        .await
     }
 
     async fn write(&self, method: &str, space: &str, mut body: Value) -> Value {
@@ -373,13 +373,33 @@ async fn atproto_pds_serves_only_the_canonical_member_method() {
         .iter()
         .filter_map(|m| m["value"].as_str())
         .collect();
-    assert!(methods.contains(&"com.atproto.simplespace.putMember"));
-    assert!(!methods.contains(&"com.atproto.simplespace.addMember"));
+    if methods
+        .iter()
+        .any(|m| m.starts_with("com.atproto.simplespace."))
+    {
+        assert!(methods.contains(&"com.atproto.simplespace.putMember"));
+        assert!(!methods.contains(&"com.atproto.simplespace.addMember"));
+    } else {
+        // The Nov 12 generation: member lists are memberspace's, under the
+        // canonical names only.
+        assert!(
+            methods.contains(&"com.atproto.memberspace.putMembers"),
+            "{methods:?}"
+        );
+        assert!(
+            !methods.contains(&"com.atproto.memberspace.addMembers"),
+            "{methods:?}"
+        );
+    }
 }
 
 #[tokio::test]
 #[ignore]
 async fn atproto_pds_stores_split_read_and_write_policies() {
+    if interop_support::generation(PDS).await != interop_support::Generation::Simplespace {
+        eprintln!("this host serves no simplespace methods; nothing of theirs to check");
+        return;
+    }
     // A space carrying only the split fields keeps them, and getSpace answers
     // with the split alone: the single `policy` field is not echoed back, where
     // pds.js mirrors one into it.

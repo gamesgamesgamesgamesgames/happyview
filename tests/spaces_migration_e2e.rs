@@ -26,10 +26,8 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use happyview::spaces::commit::verify_commit;
 use happyview::spaces::host_mode::HostMode;
 use happyview::spaces::lthash::{LtHashState, record_element};
-use happyview::spaces::native_client::parse_signed_commit;
 use happyview::spaces::native_sync::{SyncOutcome, sync_repo};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -145,13 +143,6 @@ async fn enable_flags(app: &TestApp) {
             .await
             .expect("enable flag");
     }
-}
-
-/// The signing key the author's DID document publishes.
-async fn author_key(did: &str) -> happyview::spaces::commit::SpaceVerifyingKey {
-    happyview::spaces::native_client::author_signing_key(&reqwest::Client::new(), PLC, did)
-        .await
-        .expect("author key resolves")
 }
 
 async fn repo_host_mode(app: &TestApp, space_id: &str, did: &str) -> HostMode {
@@ -371,21 +362,11 @@ async fn signing_in_moves_a_users_space_to_their_pds_and_keeps_it_in_sync() {
         "{listed}"
     );
 
-    let (status, latest) = pds_get(
-        &account.token,
-        "com.atproto.space.getLatestCommit",
-        &[("space", &space_uri), ("repo", &account.did)],
-    )
-    .await;
-    assert_eq!(status, 200, "getLatestCommit on the PDS failed: {latest}");
-    let commit = parse_signed_commit(&latest["commit"]).expect("commit parses");
-    verify_commit(
-        &commit,
-        &space_uri,
-        &account.did,
-        &author_key(&account.did).await,
-    )
-    .expect("the PDS's commit verifies");
+    // Authenticated as native sync does: signed, or MACed under the 0016
+    // model newer pds.js builds use.
+    let commit =
+        interop_support::verified_latest_commit(PDS, PLC, &account.token, &space_uri, &account.did)
+            .await;
 
     let records = happyview::spaces::db::list_all_space_records(
         &app.state.db,
@@ -400,7 +381,7 @@ async fn signing_in_moves_a_users_space_to_their_pds_and_keeps_it_in_sync() {
         fold.add(&record_element(&r.collection, &r.rkey, &r.cid));
     }
     assert_eq!(
-        commit.hash,
+        *commit.hash(),
         fold.hash(),
         "the PDS holds a different record set"
     );

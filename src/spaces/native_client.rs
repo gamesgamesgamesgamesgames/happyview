@@ -111,7 +111,21 @@ where
 {
     let mut all: Vec<RepoOp> = Vec::new();
     let mut cursor: Option<String> = None;
+    let mut cursors_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pages = 0usize;
+    // Whether this host pages by `since` rather than `cursor`, which shows as
+    // a page that starts over: the cursor handed back again, or ops older
+    // than the last kept. pds.js does. The spec gives `cursor` precedence,
+    // and a host that applies both drops ops sharing the last op's rev, so
+    // `since` is sent with a cursor only to a host that needs it.
+    let mut by_since = false;
     loop {
+        pages += 1;
+        if pages > MAX_REPO_OPS_PAGES {
+            return Err(AppError::Internal(format!(
+                "listRepoOps ran past {MAX_REPO_OPS_PAGES} pages"
+            )));
+        }
         let mut params = vec![
             ("space", space_uri.to_string()),
             ("repo", author_did.to_string()),
@@ -124,30 +138,54 @@ where
             }
             Some(c) => {
                 params.push(("cursor", c.clone()));
-                // Also the last rev seen, as `since`. The spec gives `cursor`
-                // precedence, so a conforming host ignores it; pds.js ignores
-                // `cursor` instead and pages by `since` alone, and without this
-                // re-serves the first page forever.
-                if let Some(last) = all.last() {
-                    params.push(("since", last.rev.clone()));
+                if by_since {
+                    // The last rev kept, or where the listing began.
+                    if let Some(rev) = all.last().map(|op| op.rev.as_str()).or(since) {
+                        params.push(("since", rev.to_string()));
+                    }
                 }
             }
         }
 
         let (ops, next) = parse_repo_ops_page(&fetch(params).await?)?;
-        all.extend(ops);
 
-        match next {
-            Some(next) if Some(&next) == cursor.as_ref() => {
+        let starts_over = cursor.is_some()
+            && (next.as_ref() == cursor.as_ref()
+                || matches!((ops.first(), all.last()), (Some(first), Some(last)) if first.rev < last.rev));
+        if starts_over {
+            if by_since {
                 return Err(AppError::Internal(
-                    "listRepoOps returned the same cursor twice".into(),
+                    "listRepoOps returned the same page twice".into(),
                 ));
             }
-            Some(next) => cursor = Some(next),
+            // The host ignored the cursor and served an earlier page: ask
+            // again, by `since`, without keeping it.
+            by_since = true;
+            continue;
+        }
+        all.extend(ops);
+        if all.len() > MAX_REPO_OPS {
+            return Err(AppError::Internal(format!(
+                "listRepoOps returned more than {MAX_REPO_OPS} ops"
+            )));
+        }
+        match next {
+            Some(next) => {
+                if !cursors_seen.insert(next.clone()) {
+                    return Err(AppError::Internal(
+                        "listRepoOps returned a cursor it had already given".into(),
+                    ));
+                }
+                cursor = Some(next);
+            }
             None => return Ok(all),
         }
     }
 }
+
+/// The most pages, and ops, one listing collects before it is given up on.
+const MAX_REPO_OPS_PAGES: usize = 10_000;
+const MAX_REPO_OPS: usize = 1_000_000;
 
 fn decode_32(value: &serde_json::Value, field: &str) -> Result<[u8; 32], AppError> {
     decode_lex_bytes(value, field)?
@@ -547,9 +585,113 @@ mod tests {
         assert!(requests[0].contains(&("since", "3start".to_string())));
         assert!(requests[1].contains(&("cursor", "3a/0".to_string())));
         assert!(
-            requests[1].contains(&("since", "3a".to_string())),
-            "a continuation also carries the last rev, for hosts that ignore cursor"
+            !requests[1].iter().any(|(k, _)| *k == "since"),
+            "a host that applies both would drop ops sharing the last rev"
         );
+    }
+
+    /// pds.js resuming from a saved `since` past one page: the first
+    /// continuation starts the repo over, which is not kept, and the rest is
+    /// read by `since`.
+    #[tokio::test]
+    async fn a_host_that_pages_by_since_resumes_without_rereading() {
+        let revs = ["3r1", "3r2", "3r3", "3r4", "3r5"];
+        let requests = std::sync::Mutex::new(Vec::new());
+        // pds.js: ops after `since` (or from the start), two at a time, with
+        // the last op's rev as the cursor, whatever cursor it was sent.
+        let ops = collect_repo_ops(SPACE, AUTHOR, Some("3r1"), |params| {
+            requests.lock().unwrap().push(params.clone());
+            let since = params
+                .iter()
+                .find(|(k, _)| *k == "since")
+                .map(|(_, v)| v.clone());
+            let page: Vec<&str> = revs
+                .iter()
+                .filter(|r| since.as_deref().is_none_or(|s| **r > s))
+                .take(2)
+                .copied()
+                .collect();
+            let last = page.last().map(|r| r.to_string());
+            let more = page.len() == 2 && last.as_deref() != Some("3r5");
+            async move {
+                Ok(serde_json::json!({
+                    "ops": page.iter().map(|r| serde_json::json!(
+                        { "rev": r, "collection": "c.n", "rkey": r, "cid": "bafya", "prev": null }
+                    )).collect::<Vec<_>>(),
+                    "cursor": if more { last } else { None },
+                }))
+            }
+        })
+        .await
+        .expect("collects");
+        let got: Vec<_> = ops.iter().map(|o| o.rev.as_str()).collect();
+        assert_eq!(got, ["3r2", "3r3", "3r4", "3r5"]);
+        assert!(requests.into_inner().unwrap().len() <= 4);
+    }
+
+    /// A cursor handed out twice, or a listing past the bound, is an error,
+    /// not a loop.
+    #[tokio::test]
+    async fn a_listing_is_bounded() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = collect_repo_ops(SPACE, AUTHOR, None, |_| {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                Ok(serde_json::json!({
+                    "ops": [{ "rev": format!("3{n:012}"), "collection": "c.n", "rkey": "a", "cid": "bafya", "prev": null }],
+                    "cursor": if n.is_multiple_of(2) { "x" } else { "y" },
+                }))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(calls.into_inner() < 10);
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = collect_repo_ops(SPACE, AUTHOR, None, |_| {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                Ok(serde_json::json!({
+                    "ops": [{ "rev": format!("3{n:012}"), "collection": "c.n", "rkey": "a", "cid": "bafya", "prev": null }],
+                    "cursor": format!("c{n}"),
+                }))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.into_inner(), MAX_REPO_OPS_PAGES);
+    }
+
+    /// A host that ignores `cursor` and pages by `since` (pds.js) serves the
+    /// first page again; it is asked once more with the last rev as `since`,
+    /// and the repeat isn't kept.
+    #[tokio::test]
+    async fn a_host_that_pages_by_since_is_asked_by_since() {
+        let requests = std::sync::Mutex::new(Vec::new());
+        let ops = collect_repo_ops(SPACE, AUTHOR, None, |params| {
+            requests.lock().unwrap().push(params.clone());
+            let since = params
+                .iter()
+                .find(|(k, _)| *k == "since")
+                .map(|(_, v)| v.clone());
+            async move {
+                Ok(match since.as_deref() {
+                    None => serde_json::json!({ "ops": [
+                        { "rev": "3a", "collection": "c.n", "rkey": "a", "cid": "bafya", "prev": null }
+                    ], "cursor": "3a" }),
+                    Some(_) => serde_json::json!({ "ops": [
+                        { "rev": "3b", "collection": "c.n", "rkey": "b", "cid": "bafyb", "prev": null }
+                    ] }),
+                })
+            }
+        })
+        .await
+        .expect("collects");
+        let rkeys: Vec<_> = ops.iter().map(|o| o.rkey.as_str()).collect();
+        assert_eq!(rkeys, ["a", "b"]);
+        let requests = requests.into_inner().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].contains(&("since", "3a".to_string())));
     }
 
     #[tokio::test]
