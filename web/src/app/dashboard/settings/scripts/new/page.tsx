@@ -39,6 +39,7 @@ import { Button } from "@/components/ui/button";
 
 import { MigrateScriptDialog } from "../migrate-dialog";
 import {
+  ACCOUNT_SOURCE,
   JOB_SOURCE,
   ScriptForm,
   type ScriptFormState,
@@ -290,10 +291,14 @@ function initialState(
     const parsed = parseTriggerId(presetId);
     if (parsed) {
       const isJob = parsed.kind === "job.run";
+      const isAccount =
+        parsed.kind === "identity" ||
+        parsed.kind === "account" ||
+        parsed.kind === "repo";
       return {
         kind: parsed.kind,
         suffix: parsed.suffix,
-        source: isJob ? JOB_SOURCE : parsed.suffix,
+        source: isJob ? JOB_SOURCE : isAccount ? ACCOUNT_SOURCE : parsed.suffix,
         description: "",
         body: defaultBodyFor(parsed.kind, language),
         language,

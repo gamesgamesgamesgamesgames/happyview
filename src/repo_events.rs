@@ -22,8 +22,12 @@ use crate::AppState;
 use crate::db::adapt_sql;
 use crate::lua::scripts::{ParsedTrigger, TriggerKind};
 
-/// How long whether a DID is indexed is remembered.
+/// How long a DID found indexed is remembered.
 const HELD_TTL_SECONDS: i64 = 300;
+/// How long a DID found not indexed is remembered: briefly, because an
+/// account's first identity and account events often arrive just before its
+/// first records.
+const NOT_HELD_TTL_SECONDS: i64 = 15;
 /// The most DIDs remembered at once; past it, the cache starts over.
 const HELD_CAPACITY: usize = 100_000;
 
@@ -41,17 +45,29 @@ impl HeldCache {
             .map(|entry| entry.0)
     }
 
+    /// Forget what was found for `did`, so the next event looks again.
+    pub fn forget(&self, did: &str) {
+        self.held.remove(did);
+    }
+
     fn put(&self, did: &str, held: bool, now: i64) {
         if self.held.len() >= HELD_CAPACITY && !self.held.contains_key(did) {
             self.held.clear();
         }
-        self.held
-            .insert(did.to_string(), (held, now + HELD_TTL_SECONDS));
+        let ttl = if held {
+            HELD_TTL_SECONDS
+        } else {
+            NOT_HELD_TTL_SECONDS
+        };
+        self.held.insert(did.to_string(), (held, now + ttl));
     }
 }
 
-/// Whether this instance indexes `did`. A lookup that fails reads as not
-/// indexed, so a database hiccup never fires a script for a stranger.
+/// Whether this instance indexes `did`: it holds records for it, or did
+/// until HappyView purged them for a suspension, takedown, deletion or
+/// resync (a DID tombstone, or the state recorded here), so a reinstated or
+/// resynced account still counts. A lookup that fails reads as not indexed,
+/// so a database hiccup never fires a script for a stranger.
 async fn indexed(state: &AppState, cache: &Arc<HeldCache>, did: &str) -> bool {
     let now = chrono::Utc::now().timestamp();
     if let Some(held) = cache.get(did, now) {
@@ -61,9 +77,38 @@ async fn indexed(state: &AppState, cache: &Arc<HeldCache>, did: &str) -> bool {
         .records
         .holds_network_records(did, None)
         .await
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || known_here(state, did).await;
     cache.put(did, held, now);
     held
+}
+
+/// Whether HappyView keeps a DID tombstone or recorded state for `did`.
+async fn known_here(state: &AppState, did: &str) -> bool {
+    let row: Result<Option<(String,)>, _> = crate::db::query_as(&adapt_sql(
+        "SELECT did FROM happyview_did_tombstones WHERE did = ? \
+         UNION ALL SELECT did FROM happyview_repo_event_state WHERE did = ? LIMIT 1",
+        state.db_backend,
+    ))
+    .bind(did)
+    .bind(did)
+    .fetch_optional(&state.db)
+    .await;
+    matches!(row, Ok(Some(_)))
+}
+
+/// Forget an account's recorded state, once it is deleted.
+async fn forget(state: &AppState, did: &str) {
+    let result = crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_repo_event_state WHERE did = ?",
+        state.db_backend,
+    ))
+    .bind(did)
+    .execute(&state.db)
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(did, error = %e, "could not forget a deleted account's state");
+    }
 }
 
 /// What HappyView last recorded of an account.
@@ -231,25 +276,45 @@ pub async fn account(
         .collect();
     let triggers = bound(state, fired).await;
     run(state, &triggers, did, &input).await;
+    // A deleted account's handle and status aren't kept once its scripts
+    // have heard of the deletion.
+    if !active && status == Some("deleted") {
+        forget(state, did).await;
+    }
 }
 
-/// A `#sync` event: `repo:sync`. Called after HappyView's resync purge.
-pub async fn sync(
+/// A `#sync` event: the `repo:sync` scripts it will run, decided before
+/// HappyView's resync purge, which removes the records that make the
+/// account count as indexed. Empty for a replayed marker.
+pub async fn sync_triggers(
     state: &AppState,
     did: &str,
-    rev: Option<&str>,
     as_of_us: Option<i64>,
-    time_us: Option<i64>,
-) {
+) -> Vec<ParsedTrigger> {
     if as_of_us.is_some() {
-        return;
+        return Vec::new();
     }
     let triggers = bound(state, vec![trigger(TriggerKind::Repo, "sync")]).await;
     if triggers.is_empty() || !indexed(state, &state.repo_event_held, did).await {
+        return Vec::new();
+    }
+    triggers
+}
+
+/// Run `triggers` (from [`sync_triggers`]) for a `#sync` event, after the
+/// resync purge.
+pub async fn sync(
+    state: &AppState,
+    triggers: &[ParsedTrigger],
+    did: &str,
+    rev: Option<&str>,
+    time_us: Option<i64>,
+) {
+    if triggers.is_empty() {
         return;
     }
     let input = json!({ "did": did, "rev": rev, "time": time_of(time_us) });
-    run(state, &triggers, did, &input).await;
+    run(state, triggers, did, &input).await;
 }
 
 async fn run(state: &AppState, triggers: &[ParsedTrigger], did: &str, input: &Value) {
@@ -329,6 +394,13 @@ mod tests {
         cache.put("did:plc:a", true, 0);
         assert_eq!(cache.get("did:plc:a", 10), Some(true));
         assert_eq!(cache.get("did:plc:a", HELD_TTL_SECONDS + 1), None);
+        // Not indexed is remembered only briefly.
+        cache.put("did:plc:b", false, 0);
+        assert_eq!(
+            cache.get("did:plc:b", NOT_HELD_TTL_SECONDS - 1),
+            Some(false)
+        );
+        assert_eq!(cache.get("did:plc:b", NOT_HELD_TTL_SECONDS + 1), None);
         for i in 0..HELD_CAPACITY {
             cache.put(&format!("did:plc:{i}"), false, 0);
         }

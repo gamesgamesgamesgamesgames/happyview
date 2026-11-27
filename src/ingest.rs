@@ -158,14 +158,20 @@ pub(crate) async fn apply_in(state: &AppState, event: SourceEvent) -> Applied {
             // A replayed sync acts as of its own rev, or its own time when
             // it carries none (P2).
             let before = as_of_us.map(|t| rev.clone().unwrap_or_else(|| tid(t)));
+            // Whether a `repo:sync` script runs is decided before the purge
+            // removes the records that make the account count as indexed.
+            let scripts = crate::repo_events::sync_triggers(state, &did, as_of_us).await;
             let applied = crate::db::with_change_reason(
                 Some("purge:sync".to_string()),
                 repo_resynced(state, &did, rev.as_deref(), &tracked, before.as_deref()),
             )
             .await;
             // After the resync purge, so a `repo:sync` script sees the repo
-            // as HappyView now holds it.
-            crate::repo_events::sync(state, &did, rev.as_deref(), as_of_us, time_us).await;
+            // as HappyView now holds it; not when the purge failed, since
+            // the event is applied again.
+            if applied.error.is_none() {
+                crate::repo_events::sync(state, &scripts, &did, rev.as_deref(), time_us).await;
+            }
             applied
         }
         SourceEvent::Identity {

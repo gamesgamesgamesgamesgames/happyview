@@ -49,6 +49,10 @@ async fn app() -> TestApp {
         )
         .await
         .expect("store the game lexicon");
+    // What a served instance tracks, so a resync or a takedown purges.
+    app.state
+        .collections_tx
+        .send_replace(app.state.lexicons.get_record_collections().await);
     app.state
         .plugin_registry
         .register(echo_interpreter::plugin("lua"))
@@ -325,11 +329,86 @@ async fn repo_sync_names_the_rev() {
     .await;
 
     let runs = runs(&app).await;
-    assert_eq!(triggers(&runs), ["repo:sync"]);
+    assert_eq!(
+        triggers(&runs),
+        ["repo:sync"],
+        "it runs although the resync removed the records"
+    );
     assert_eq!(
         runs[0].1,
         json!({ "did": DID, "rev": "3kbcq3p7ad400", "time": "2023-11-14T22:13:20.000000Z" })
     );
+    assert!(
+        app.state
+            .records
+            .get(&format!("at://{DID}/{GAME}/held"))
+            .await
+            .unwrap()
+            .is_none(),
+        "the resync purged the records first"
+    );
+}
+
+/// A suspended account's records are purged, but it is still an account
+/// this instance indexes: reinstated, it runs `account:activate`.
+#[tokio::test]
+#[serial]
+async fn a_reinstated_account_still_runs_its_scripts() {
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    for t in ACCOUNT_TRIGGERS {
+        install(&app, t, "host:log_input").await;
+    }
+    let _ =
+        happyview::ingest::apply(&app.state, account(DID, false, Some("suspended"), None)).await;
+    assert!(
+        app.state
+            .records
+            .get(&format!("at://{DID}/{GAME}/held"))
+            .await
+            .unwrap()
+            .is_none(),
+        "a suspension purges"
+    );
+    // As if the cached answer had expired.
+    app.state.repo_event_held.forget(DID);
+    let _ = happyview::ingest::apply(&app.state, account(DID, true, None, None)).await;
+
+    let runs = runs(&app).await;
+    assert_eq!(
+        triggers(&runs),
+        [
+            "account:update",
+            "account:suspend",
+            "account:update",
+            "account:activate"
+        ]
+    );
+    assert_eq!(runs[3].1["previous_status"], json!("suspended"));
+}
+
+/// Once its scripts have heard of a deletion, the account's recorded handle
+/// and status are dropped.
+#[tokio::test]
+#[serial]
+async fn a_deleted_accounts_state_is_not_kept() {
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    install(&app, "identity:update", "host:log_input").await;
+    install(&app, "account:delete", "host:log_input").await;
+    let _ = happyview::ingest::apply(&app.state, identity(DID, Some("a.test"), None)).await;
+    let _ = happyview::ingest::apply(&app.state, account(DID, false, Some("deleted"), None)).await;
+    let (rows,): (i64,) = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT COUNT(*) FROM happyview_repo_event_state WHERE did = ?",
+        app.state.db_backend,
+    ))
+    .bind(DID)
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(rows, 0);
 }
 
 #[tokio::test]

@@ -556,7 +556,7 @@ fn summary_from_scripts_row(row: &ScriptsDeadLetterRow) -> DeadLetterSummary {
     let (lexicon_id, collection, did, rkey, action) = match host_kind.as_str() {
         // An identity, account or sync script: the trigger names the event.
         crate::lua::scripts::REPO_EVENT_HOST_KIND => (
-            script_ref.clone(),
+            String::new(),
             String::new(),
             host_id.clone(),
             String::new(),
