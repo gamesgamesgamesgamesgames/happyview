@@ -133,17 +133,16 @@ impl HttpClient for HappyViewHttpClient {
         Box<dyn std::error::Error + Send + Sync + 'static>,
     > {
         let _ = HEADER_EXCHANGE.try_with(|exchange| {
-            request
-                .headers_mut()
-                .insert(exchange.send.0.clone(), exchange.send.1.clone());
+            for (name, value) in &exchange.send {
+                request.headers_mut().insert(name.clone(), value.clone());
+            }
         });
         let response = self.0.execute(request.try_into()?).await?;
         let _ = HEADER_EXCHANGE.try_with(|exchange| {
-            // Every response overwrites the last, so the value kept is the
+            // Every response overwrites the last, so the headers kept are the
             // final response's: the request's own, after any token refresh or
             // nonce retry the session made on the way.
-            *exchange.received.lock().expect("not poisoned") =
-                response.headers().get(&exchange.receive).cloned();
+            *exchange.received.lock().expect("not poisoned") = response.headers().clone();
         });
         let mut builder = atrium_xrpc::http::Response::builder().status(response.status());
         for (k, v) in response.headers() {
@@ -158,9 +157,8 @@ impl HttpClient for HappyViewHttpClient {
 use atrium_xrpc::http::{HeaderName, HeaderValue};
 
 struct HeaderExchange {
-    send: (HeaderName, HeaderValue),
-    receive: HeaderName,
-    received: std::sync::Mutex<Option<HeaderValue>>,
+    send: Vec<(HeaderName, HeaderValue)>,
+    received: std::sync::Mutex<atrium_xrpc::http::HeaderMap>,
 }
 
 tokio::task_local! {
@@ -179,16 +177,27 @@ pub async fn with_header_exchange<F: std::future::Future>(
     receive: HeaderName,
     fut: F,
 ) -> (F::Output, Option<HeaderValue>) {
+    let (output, mut received) = with_headers(vec![send], fut).await;
+    (output, received.remove(&receive))
+}
+
+/// Run `fut` with headers added to every request it makes through
+/// [`HappyViewHttpClient`], returning the last response's headers (empty when
+/// no request was made).
+pub async fn with_headers<F: std::future::Future>(
+    send: Vec<(HeaderName, HeaderValue)>,
+    fut: F,
+) -> (F::Output, atrium_xrpc::http::HeaderMap) {
     let exchange = HeaderExchange {
         send,
-        receive,
-        received: std::sync::Mutex::new(None),
+        received: std::sync::Mutex::new(atrium_xrpc::http::HeaderMap::new()),
     };
     HEADER_EXCHANGE
         .scope(exchange, async {
             let output = fut.await;
-            let received = HEADER_EXCHANGE
-                .with(|exchange| exchange.received.lock().expect("not poisoned").take());
+            let received = HEADER_EXCHANGE.with(|exchange| {
+                std::mem::take(&mut *exchange.received.lock().expect("not poisoned"))
+            });
             (output, received)
         })
         .await
@@ -203,6 +212,78 @@ mod tests {
     #[test]
     fn build_http_client_succeeds() {
         let _ = build_http_client("HappyView/test");
+    }
+
+    /// A server answering each of `answers` in turn, one connection each,
+    /// keeping what each request carried.
+    async fn answering(
+        answers: Vec<&'static str>,
+    ) -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&received);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for answer in answers {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    sink.lock()
+                        .await
+                        .push(String::from_utf8_lossy(&buf[..n]).to_lowercase());
+                    let _ = sock.write_all(answer.as_bytes()).await;
+                }
+            }
+        });
+        (format!("http://{addr}/"), received)
+    }
+
+    #[tokio::test]
+    async fn headers_are_sent_on_every_request_and_the_last_answer_kept() {
+        let (url, received) = answering(vec![
+            "HTTP/1.1 401 Unauthorized\r\nx-answer: first\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nx-answer: a\r\nx-answer: b\r\nx-other: c\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        ])
+        .await;
+        let client = HappyViewHttpClient::default();
+        let send = || {
+            client.send_http(
+                atrium_xrpc::http::Request::get(url.clone())
+                    .body(Vec::new())
+                    .unwrap(),
+            )
+        };
+        // Two requests in one exchange, as a session's retry makes.
+        let (_, headers) = with_headers(
+            vec![
+                (
+                    HeaderName::from_static("x-one"),
+                    HeaderValue::from_static("1"),
+                ),
+                (
+                    HeaderName::from_static("x-two"),
+                    HeaderValue::from_static("2"),
+                ),
+            ],
+            async {
+                let _ = send().await;
+                send().await
+            },
+        )
+        .await;
+
+        let received = received.lock().await;
+        assert_eq!(received.len(), 2);
+        for request in received.iter() {
+            assert!(
+                request.contains("x-one: 1") && request.contains("x-two: 2"),
+                "{request}"
+            );
+        }
+        let answers: Vec<_> = headers.get_all("x-answer").iter().collect();
+        assert_eq!(answers, ["a", "b"], "the last response's, every line");
+        assert_eq!(headers.get("x-other").unwrap(), "c");
     }
 
     #[tokio::test]

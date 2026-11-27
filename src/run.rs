@@ -1162,6 +1162,7 @@ async fn boot(
         labeler_subscriptions_tx,
         labeler_subscription_cache: Arc::new(crate::labeler::SubscriptionCache::default()),
         repo_event_held: Arc::default(),
+        repo_update_senders: Arc::default(),
         rate_limiter,
         oauth: oauth_registry,
         oauth_state_store,

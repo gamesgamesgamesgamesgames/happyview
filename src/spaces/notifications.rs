@@ -567,9 +567,38 @@ async fn deliver_repo_update(
     Ok(())
 }
 
-/// The method that tells a repo host a credential is revoked, and the `lxm` its
-/// service auth is bound to.
-const NOTIFY_CREDENTIAL_REVOKED_LXM: &str = "com.atproto.space.notifyCredentialRevoked";
+/// The methods that tell a repo host credentials are revoked, newest first,
+/// each also the `lxm` its service auth is bound to: the Nov 12 name, then the
+/// earlier one for a host that doesn't implement it.
+const NOTIFY_CREDENTIALS_REVOKED_LXMS: [&str; 2] = [
+    "com.atproto.space.notifyCredentialsRevoked",
+    "com.atproto.space.notifyCredentialRevoked",
+];
+
+/// Whether a host's answer to a revocation says it doesn't implement the
+/// method called: a 404 or 501, or an error named so.
+fn method_not_implemented(err: &AppError) -> bool {
+    match err {
+        AppError::XrpcError {
+            status,
+            code: REVOCATION_REFUSED,
+            message,
+        } => {
+            matches!(status.as_u16(), 404 | 501)
+                || serde_json::from_str::<serde_json::Value>(message)
+                    .ok()
+                    .and_then(|body| body.get("error")?.as_str().map(str::to_string))
+                    .is_some_and(|e| {
+                        matches!(e.as_str(), "MethodNotImplemented" | "XRPCNotSupported")
+                    })
+        }
+        _ => false,
+    }
+}
+
+/// The code a repo host's refusal of a revocation is carried under, with its
+/// status and its body as the message.
+const REVOCATION_REFUSED: &str = "RevocationRefused";
 
 /// How many `jti`s one `notifyCredentialRevoked` call may carry.
 const MAX_REVOKED_PER_CALL: usize = 100;
@@ -636,64 +665,234 @@ async fn deliver_revocations(
             );
             continue;
         };
-        let url = format!(
-            "{}/xrpc/{NOTIFY_CREDENTIAL_REVOKED_LXM}",
-            endpoint.trim_end_matches('/')
-        );
-        for batch in jtis.chunks(MAX_REVOKED_PER_CALL) {
-            // Addressed to the repo, which is what its host accepts service auth for.
-            let token = match crate::spaces::authority::mint_service_auth_or_instance(
-                &state.db,
-                state.db_backend,
-                encryption_key,
-                &state.config.public_url,
-                &space.authority_did,
-                &repo,
-                NOTIFY_CREDENTIAL_REVOKED_LXM,
-            )
-            .await
-            {
-                Ok(token) => token,
-                Err(e) => {
-                    // One repo's host is told nothing; the others still are.
-                    tracing::warn!(repo, error = %e, "could not authenticate a revocation");
-                    break;
-                }
-            };
-            // The space named in the form the host takes; once more in the
-            // other form if it refuses that one as malformed.
-            let result = crate::spaces::pds_support::with_space_uri_form(
-                state,
-                Some(&endpoint),
-                &space_uri,
-                |space| {
-                    let request = state
-                        .http
-                        .post(&url)
-                        .bearer_auth(&token)
-                        .json(&serde_json::json!({ "space": space, "credentials": batch }));
-                    async move {
-                        let resp = request.send().await.map_err(|e| {
-                            AppError::Internal(format!("could not deliver a revocation: {e}"))
-                        })?;
-                        let status = resp.status();
-                        if status.is_success() {
-                            return Ok(());
-                        }
-                        let body = resp.text().await.unwrap_or_default();
-                        Err(AppError::Internal(format!(
-                            "repo host answered a revocation with {status}: {body}"
-                        )))
+        'batches: for batch in jtis.chunks(MAX_REVOKED_PER_CALL) {
+            for (i, lxm) in NOTIFY_CREDENTIALS_REVOKED_LXMS.iter().enumerate() {
+                let url = format!("{}/xrpc/{lxm}", endpoint.trim_end_matches('/'));
+                // Addressed to the repo, which is what its host accepts service auth for.
+                let token = match crate::spaces::authority::mint_service_auth_or_instance(
+                    &state.db,
+                    state.db_backend,
+                    encryption_key,
+                    &state.config.public_url,
+                    &space.authority_did,
+                    &repo,
+                    lxm,
+                )
+                .await
+                {
+                    Ok(token) => token,
+                    Err(e) => {
+                        // One repo's host is told nothing; the others still are.
+                        tracing::warn!(repo, error = %e, "could not authenticate a revocation");
+                        break 'batches;
                     }
-                },
-            )
-            .await;
-            if let Err(e) = result {
-                tracing::warn!(repo, error = %e, "repo host did not accept a revocation");
+                };
+                // The space named in the form the host takes; once more in the
+                // other form if it refuses that one as malformed.
+                let result = crate::spaces::pds_support::with_space_uri_form(
+                    state,
+                    Some(&endpoint),
+                    &space_uri,
+                    |space| {
+                        let request = state
+                            .http
+                            .post(&url)
+                            .bearer_auth(&token)
+                            .json(&serde_json::json!({ "space": space, "credentials": batch }));
+                        async move {
+                            let resp = request.send().await.map_err(|e| {
+                                AppError::Internal(format!("could not deliver a revocation: {e}"))
+                            })?;
+                            let status = resp.status();
+                            if status.is_success() {
+                                return Ok(());
+                            }
+                            let body = resp.text().await.unwrap_or_default();
+                            Err(AppError::XrpcError {
+                                status: axum::http::StatusCode::from_u16(status.as_u16())
+                                    .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
+                                code: REVOCATION_REFUSED,
+                                message: body,
+                            })
+                        }
+                    },
+                )
+                .await;
+                match result {
+                    Err(e)
+                        if i + 1 < NOTIFY_CREDENTIALS_REVOKED_LXMS.len()
+                            && method_not_implemented(&e) =>
+                    {
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(repo, error = %e, "repo host did not accept a revocation");
+                    }
+                    Ok(()) => {}
+                }
+                break;
             }
         }
     }
     Ok(())
+}
+
+/// The most `notifyRepoUpdate` calls one sender may make in an hour, and in
+/// a day, as the reference space host allows. Its host retries when refused.
+const REPO_UPDATES_PER_HOUR: u32 = 1500;
+const REPO_UPDATES_PER_DAY: u32 = 10_000;
+
+/// The most senders tracked at once. Past it, senders whose day has ended
+/// are dropped (at most once a minute), and otherwise the stalest of a few
+/// is, so a new sender is always counted.
+const MAX_REPO_UPDATE_SENDERS: usize = 100_000;
+/// How many tracked senders are looked at to choose one to drop.
+const EVICTION_SAMPLE: usize = 16;
+
+/// Per sender: the start of its current hour and day windows, and its calls
+/// in each.
+#[derive(Default)]
+pub struct SenderLimits {
+    senders: dashmap::DashMap<String, [(i64, u32); 2]>,
+    /// When senders whose day has ended were last dropped.
+    last_sweep: std::sync::atomic::AtomicI64,
+}
+
+impl SenderLimits {
+    /// Count a `notifyRepoUpdate` from `sender`, refusing it as
+    /// `RateLimited` once the sender is over either limit.
+    pub fn charge(&self, sender: &str) -> Result<(), AppError> {
+        self.charge_at(sender, chrono::Utc::now().timestamp())
+    }
+
+    fn charge_at(&self, sender: &str, now: i64) -> Result<(), AppError> {
+        const WINDOWS: [(i64, u32); 2] = [
+            (3600, REPO_UPDATES_PER_HOUR),
+            (86_400, REPO_UPDATES_PER_DAY),
+        ];
+        if !self.senders.contains_key(sender) && self.senders.len() >= MAX_REPO_UPDATE_SENDERS {
+            use std::sync::atomic::Ordering;
+            let last = self.last_sweep.load(Ordering::Relaxed);
+            if now - last >= 60
+                && self
+                    .last_sweep
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                self.senders
+                    .retain(|_, windows| now - windows[1].0 < WINDOWS[1].0);
+            }
+            if self.senders.len() >= MAX_REPO_UPDATE_SENDERS {
+                // The sender whose hour began longest ago, of a few.
+                let stalest = self
+                    .senders
+                    .iter()
+                    .take(EVICTION_SAMPLE)
+                    .min_by_key(|e| e.value()[0].0)
+                    .map(|e| e.key().clone());
+                if let Some(key) = stalest {
+                    self.senders.remove(&key);
+                }
+            }
+        }
+        let mut entry = self
+            .senders
+            .entry(sender.to_string())
+            .or_insert([(now, 0), (now, 0)]);
+        for (i, (length, _)) in WINDOWS.iter().enumerate() {
+            if now - entry[i].0 >= *length {
+                entry[i] = (now, 0);
+            }
+        }
+        for (i, (length, limit)) in WINDOWS.iter().enumerate() {
+            if entry[i].1 >= *limit {
+                let reset = (entry[i].0 + length).max(now) as u64;
+                return Err(AppError::RateLimited {
+                    retry_after: reset - now as u64,
+                    limit: *limit,
+                    reset,
+                });
+            }
+        }
+        for counted in entry.iter_mut() {
+            counted.1 += 1;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod repo_update_limit_tests {
+    use super::*;
+
+    #[test]
+    fn a_sender_is_limited_per_hour_and_per_day() {
+        let limits = SenderLimits::default();
+        let sender = format!("did:plc:{}", uuid::Uuid::new_v4().simple());
+        let t = 1_000_000;
+        for _ in 0..REPO_UPDATES_PER_HOUR {
+            limits.charge_at(&sender, t).unwrap();
+        }
+        let err = limits.charge_at(&sender, t + 10).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AppError::RateLimited {
+                    limit: REPO_UPDATES_PER_HOUR,
+                    retry_after: 3590,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        // Another sender is untouched.
+        limits.charge_at(&format!("{sender}x"), t).unwrap();
+
+        // The next hour admits it again, until the day's limit.
+        let mut now = t;
+        let mut admitted = REPO_UPDATES_PER_HOUR;
+        while admitted < REPO_UPDATES_PER_DAY {
+            now += 3600;
+            for _ in 0..REPO_UPDATES_PER_HOUR.min(REPO_UPDATES_PER_DAY - admitted) {
+                limits.charge_at(&sender, now).unwrap();
+                admitted += 1;
+            }
+        }
+        let err = limits.charge_at(&sender, now + 3600).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AppError::RateLimited {
+                    limit: REPO_UPDATES_PER_DAY,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        // A day on, it is admitted.
+        limits.charge_at(&sender, t + 86_400).unwrap();
+    }
+
+    #[test]
+    fn the_senders_tracked_are_bounded() {
+        let limits = SenderLimits::default();
+        let t = 1_000_000;
+        for i in 0..MAX_REPO_UPDATE_SENDERS {
+            limits
+                .charge_at(&format!("did:web:s{i}.example"), t)
+                .unwrap();
+        }
+        // Full, with every sender's day still running: a new sender is
+        // counted, in place of one already tracked.
+        limits.charge_at("did:web:new.example", t + 10).unwrap();
+        assert_eq!(limits.senders.len(), MAX_REPO_UPDATE_SENDERS);
+        assert!(limits.senders.contains_key("did:web:new.example"));
+        // Once their days end, they're dropped together.
+        limits
+            .charge_at("did:web:later.example", t + 86_400)
+            .unwrap();
+        assert!(limits.senders.len() <= 3, "{}", limits.senders.len());
+    }
 }
 
 #[cfg(test)]

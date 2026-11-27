@@ -132,6 +132,8 @@ pub struct AppState {
     pub labeler_subscription_cache: Arc<labeler::SubscriptionCache>,
     /// Which DIDs `identity:*`, `account:*` and `repo:*` scripts fire for.
     pub repo_event_held: Arc<repo_events::HeldCache>,
+    /// Each `notifyRepoUpdate` sender's calls in its current hour and day.
+    pub repo_update_senders: Arc<spaces::notifications::SenderLimits>,
     pub rate_limiter: Arc<RateLimiter>,
     pub oauth: Arc<auth::OAuthClientRegistry>,
     pub oauth_state_store: DbStateStore,

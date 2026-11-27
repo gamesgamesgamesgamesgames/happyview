@@ -530,6 +530,11 @@ async fn write_run(
     // One transaction for the run, so each record's share is an even one.
     let share = started.elapsed() / u32::try_from(timers.len()).unwrap_or(u32::MAX);
     for timer in timers {
+        let timer = if written.is_ok() {
+            timer
+        } else {
+            timer.undelivered()
+        };
         timer.finish(&state.metrics, Some((stages::WRITE, share)));
     }
     let changed = match written {
@@ -875,8 +880,12 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
                 // The delivery this retries failed open and stored the body
                 // as it arrived; the hook now says it should not be there.
                 HookedBody::Skip if ev.origin == Origin::Retry => {
+                    let outcome = remove_failed_open(state, ev, rec, &uri).await;
+                    let removed =
+                        !matches!(outcome, IngestOutcome::Errored | IngestOutcome::Unavailable);
+                    let timer = if removed { timer } else { timer.undelivered() };
                     timer.finish(&state.metrics, None);
-                    return remove_failed_open(state, ev, rec, &uri).await;
+                    return outcome;
                 }
                 HookedBody::Skip | HookedBody::CidMismatch => {
                     timer.finish(&state.metrics, None);
@@ -896,6 +905,11 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
             )
             .await
             .map(|changed| !changed.is_empty());
+            let timer = if written.is_ok() {
+                timer
+            } else {
+                timer.undelivered()
+            };
             timer.finish(&state.metrics, Some((stages::WRITE, started.elapsed())));
             match written {
                 Ok(changed) => {
@@ -953,6 +967,11 @@ async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOu
                 }),
             )
             .await;
+            let timer = if deleted.is_ok() {
+                timer
+            } else {
+                timer.undelivered()
+            };
             timer.finish(&state.metrics, Some((stages::WRITE, started.elapsed())));
             match deleted {
                 Ok(_) => {
@@ -1173,7 +1192,9 @@ async fn apply_claimed(
                 return (outcome, false);
             }
             Err(e) => {
-                timer.finish(&state.metrics, Some((stages::DELTA, writing.elapsed())));
+                timer
+                    .undelivered()
+                    .finish(&state.metrics, Some((stages::DELTA, writing.elapsed())));
                 tracing::warn!(uri = %uri, "failed to read a retried record: {e}");
                 log_record(state, event_type, Severity::Error, ev, &uri, Some(&e)).await;
                 return (
@@ -1188,6 +1209,11 @@ async fn apply_claimed(
         }
     }
     let applied = ext.apply_delta(&ev.key, delta, for_rev.as_deref()).await;
+    let timer = if applied.is_ok() {
+        timer
+    } else {
+        timer.undelivered()
+    };
     timer.finish(&state.metrics, Some((stages::DELTA, writing.elapsed())));
     match applied {
         Ok(()) => {

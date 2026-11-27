@@ -32,7 +32,7 @@ use sqlx::AnyPool;
 use crate::db::{DatabaseBackend, adapt_sql};
 use crate::plugin::ScriptKind;
 
-use super::ingest::{DECISIONS, IngestBucket, IngestSummary};
+use super::ingest::{DECISIONS, IngestBucket, IngestSummary, RecordOrigin};
 use super::sketch::Sketch;
 use super::window::{
     Accumulate, Bucket, HALF_HOUR_SECS, HALF_HOURS_KEPT, History, HostImportSum, MINUTE_SECS,
@@ -117,17 +117,27 @@ impl RowKey for Key {
     }
 }
 
+/// An ingest row's `variant` is `<action>/<origin>`. A row written before
+/// origins were kept has the action alone, and reads as of unknown origin.
 impl RowKey for IngestKey {
     const KIND: &'static str = "ingest";
 
     fn encode(&self) -> (String, String) {
-        (self.collection.clone(), self.action.to_string())
+        (
+            self.collection.clone(),
+            format!("{}/{}", self.action, self.origin.as_str()),
+        )
     }
 
     fn decode(key: &str, variant: &str) -> Option<Self> {
+        let (action, origin) = match variant.split_once('/') {
+            Some((action, origin)) => (action, RecordOrigin::parse(origin)),
+            None => (variant, RecordOrigin::Unknown),
+        };
         Some(Self {
             collection: key.to_string(),
-            action: intern(variant),
+            action: intern(action),
+            origin,
         })
     }
 }
@@ -425,7 +435,7 @@ fn closed_rows<K: RowKey, B: Stored>(
     }
 }
 
-fn upsert_sql(backend: DatabaseBackend) -> String {
+pub(crate) fn upsert_sql(backend: DatabaseBackend) -> String {
     adapt_sql(
         "INSERT INTO happyview_script_metrics \
          (kind, key, variant, resolution, bucket_start, counters, sketches, instance) \
@@ -496,11 +506,17 @@ pub async fn sweep(
         return Ok(0);
     }
     let cutoff = rfc3339(now.saturating_sub(u64::from(days) * 86_400));
+    // Records delivered are kept for at least a usage meter's month.
+    let delivered_days = days.max(super::delivered::MIN_KEPT_DAYS);
+    let delivered_cutoff = rfc3339(now.saturating_sub(u64::from(delivered_days) * 86_400));
     let result = crate::db::query(&adapt_sql(
-        "DELETE FROM happyview_script_metrics WHERE bucket_start < ?",
+        "DELETE FROM happyview_script_metrics WHERE bucket_start < ? \
+         AND (kind <> ? OR bucket_start < ?)",
         backend,
     ))
     .bind(cutoff)
+    .bind(super::delivered::KIND)
+    .bind(delivered_cutoff)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
@@ -624,6 +640,9 @@ pub async fn fold(
             let encoded = match kind.as_str() {
                 k if k == Key::KIND => merge_rows::<Bucket>(&rows).encode(),
                 k if k == IngestKey::KIND => merge_rows::<IngestBucket>(&rows).encode(),
+                k if k == super::delivered::KIND => {
+                    (super::delivered::merge(&rows), "{}".to_string())
+                }
                 other => {
                     tracing::warn!(
                         kind = other,
@@ -711,6 +730,15 @@ impl Persister {
         match write_closed(metrics, pool, backend, now).await {
             Ok(n) => outcome.written = n,
             Err(e) => tracing::warn!(error = %e, "failed to write script metrics"),
+        }
+        // Whether or not script metrics are on.
+        match metrics
+            .delivered()
+            .write_closed(pool, backend, metrics.instance(), now)
+            .await
+        {
+            Ok(n) => outcome.written += n,
+            Err(e) => tracing::warn!(error = %e, "failed to write records delivered"),
         }
         if self
             .maintained_at
@@ -1117,10 +1145,11 @@ pub async fn ingest(
         now,
     )
     .await?;
-    let mut merged: HashMap<IngestKey, (IngestBucket, u64)> = HashMap::new();
+    // Every origin's records together, as the in-memory windows give them.
+    let mut merged: HashMap<(String, &'static str), (IngestBucket, u64)> = HashMap::new();
     for (key, start, bucket) in buckets {
         let (held, oldest) = merged
-            .entry(key)
+            .entry((key.collection, key.action))
             .or_insert_with(|| (IngestBucket::default(), start));
         held.merge_from(&bucket);
         *oldest = (*oldest).min(start);
@@ -1128,8 +1157,8 @@ pub async fn ingest(
     let mut out: Vec<IngestSummary> = merged
         .into_iter()
         .filter(|(_, (bucket, _))| bucket.records > 0)
-        .map(|(key, (bucket, oldest))| {
-            bucket.summary(&key.collection, key.action, now.saturating_sub(oldest) + 1)
+        .map(|((collection, action), (bucket, oldest))| {
+            bucket.summary(&collection, action, now.saturating_sub(oldest) + 1)
         })
         .collect();
     sort_ingest(&mut out);
@@ -1260,9 +1289,45 @@ mod tests {
         let ingest = IngestKey {
             collection: "a.b.c".into(),
             action: "create",
+            origin: RecordOrigin::StorePass,
         };
         let (k, v) = ingest.encode();
+        assert_eq!(v, "create/store_pass");
         assert_eq!(IngestKey::decode(&k, &v), Some(ingest));
+    }
+
+    #[test]
+    fn an_ingest_row_written_before_origins_reads_as_unknown() {
+        let old = IngestKey::decode("a.b.c", "create").unwrap();
+        assert_eq!((old.action, old.origin), ("create", RecordOrigin::Unknown));
+        let newer = IngestKey::decode("a.b.c", "delete/somewhere").unwrap();
+        assert_eq!(
+            (newer.action, newer.origin),
+            ("delete", RecordOrigin::Unknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ingest_window_adds_every_origin_together() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let m = ScriptMetrics::new();
+        let now = super::super::unix_now();
+        for origin in [RecordOrigin::Live, RecordOrigin::Backfill] {
+            m.record_ingest_at(
+                (now - 5) * 1_000,
+                "a.b.c",
+                "create",
+                origin,
+                None,
+                &record(4),
+            );
+        }
+        let memory = m.ingest_at(now, Window::Hour);
+        assert_eq!(memory.len(), 1);
+        assert_eq!(memory[0].records, 2);
+        let stored = ingest(&m, &pool, SQLITE, now, Window::Week).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].records, 2);
     }
 
     #[tokio::test]
@@ -1270,7 +1335,14 @@ mod tests {
         let pool = crate::test_support::migrated_memory_pool().await;
         let m = ScriptMetrics::new();
         run(&m, T0 + 5, 10);
-        m.record_ingest_at((T0 + 6) * 1_000, "a.b.c", "create", None, &record(4));
+        m.record_ingest_at(
+            (T0 + 6) * 1_000,
+            "a.b.c",
+            "create",
+            RecordOrigin::Live,
+            None,
+            &record(4),
+        );
         // Still open: nothing to write.
         assert_eq!(write_closed(&m, &pool, SQLITE, T0 + 30).await.unwrap(), 0);
         assert_eq!(count(&pool, MINUTE).await, 0);
@@ -1387,7 +1459,14 @@ mod tests {
         run(&before, now - 20 * 3_600, 10);
         run(&before, now - 600, 20);
         run(&before, now - 590, 20);
-        before.record_ingest_at((now - 300) * 1_000, "a.b.c", "create", None, &record(4));
+        before.record_ingest_at(
+            (now - 300) * 1_000,
+            "a.b.c",
+            "create",
+            RecordOrigin::Live,
+            None,
+            &record(4),
+        );
         // The first row has left memory's minute ring, so it is written by
         // an earlier tick, as it would have been.
         write_closed(&before, &pool, SQLITE, now - 20 * 3_600 + 60)
@@ -1459,7 +1538,14 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        m.record_ingest_at((now - 5) * 1_000, "a.b.c", "create", None, &record(4));
+        m.record_ingest_at(
+            (now - 5) * 1_000,
+            "a.b.c",
+            "create",
+            RecordOrigin::Live,
+            None,
+            &record(4),
+        );
         let rows = ingest(&m, &pool, SQLITE, now, Window::Month).await.unwrap();
         assert_eq!(rows[0].records, 1);
     }
@@ -1590,7 +1676,14 @@ mod tests {
         run(&a, now - 600, 10);
         run(&b, now - 600, 20);
         run(&b, now - 300, 20);
-        b.record_ingest_at((now - 300) * 1_000, "a.b.c", "create", None, &record(4));
+        b.record_ingest_at(
+            (now - 300) * 1_000,
+            "a.b.c",
+            "create",
+            RecordOrigin::Live,
+            None,
+            &record(4),
+        );
         write_closed(&a, &pool, SQLITE, now).await.unwrap();
         write_closed(&b, &pool, SQLITE, now).await.unwrap();
 

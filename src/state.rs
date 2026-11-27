@@ -93,6 +93,7 @@ pub fn state_with_pool_on(
         labeler_subscriptions_tx: labeler_tx,
         labeler_subscription_cache: Arc::new(crate::labeler::SubscriptionCache::default()),
         repo_event_held: Arc::default(),
+        repo_update_senders: Arc::default(),
         rate_limiter: crate::rate_limit::RateLimiter::new(crate::rate_limit::RateLimitDefaults {
             query_cost: 1,
             procedure_cost: 1,

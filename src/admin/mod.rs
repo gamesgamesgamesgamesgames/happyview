@@ -188,6 +188,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/metrics/scripts", get(metrics::scripts))
         .route("/metrics/scripts/{trigger}", get(metrics::script))
         .route("/metrics/ingest", get(metrics::ingest))
+        .route("/metrics/delivered", get(metrics::delivered))
         .route("/metrics/live", get(metrics::live))
         .route("/events/count", get(events::count_events))
         .route("/events/purge", post(events::purge_events))

@@ -2012,3 +2012,419 @@ async fn a_denial_is_not_reopened_by_an_older_method() {
         "no older method is asked"
     );
 }
+
+/// Send `body` (with `space` filled in) to `method` with service auth signed
+/// by `signer` and bound to `lxm`, returning the status and body.
+async fn notify_as(
+    method: &str,
+    signer: &str,
+    lxm: Option<&str>,
+    mut body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let mut app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+    body["space"] = json!(create_instance_space(&app, &instance_did).await);
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            signer,
+            &instance_did,
+            "#atproto_space_host",
+            lxm,
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/xrpc/{method}"))
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .header("host", "127.0.0.1:0")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+const REPO_UPDATE: &str = "com.atproto.space.notifyRepoUpdate";
+const DATA: &str = "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80";
+
+/// A repo host on the Nov 12 text reports a repo's new state with
+/// `notifyRepoUpdate`, which is taken as `notifyWrite`'s spec shape is.
+#[tokio::test]
+#[serial]
+async fn notify_repo_update_is_taken_as_notify_write() {
+    common::require_db!();
+    let writer = WRITER;
+    let (status, body) = notify_as(
+        REPO_UPDATE,
+        writer,
+        Some(REPO_UPDATE),
+        json!({ "repo": writer, "repoRev": "3lzq2b3k4c22a", "data": { "$bytes": DATA } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // zds 0.9's shape, with the state under `latest`.
+    let (status, body) = notify_as(
+        REPO_UPDATE,
+        writer,
+        Some(REPO_UPDATE),
+        json!({ "repo": writer, "latest": { "rev": "3lzq2b3k4c22a", "data": { "$bytes": DATA } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+#[serial]
+async fn notify_repo_update_refuses_an_incomplete_or_future_report() {
+    common::require_db!();
+    let writer = WRITER;
+    let (status, body) = notify_as(
+        REPO_UPDATE,
+        writer,
+        Some(REPO_UPDATE),
+        json!({ "repo": writer, "repoRev": "3lzq2b3k4c22a" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], json!("InvalidRequest"), "{body}");
+
+    // A TID in the year 2100.
+    let (status, body) = notify_as(
+        REPO_UPDATE,
+        writer,
+        Some(REPO_UPDATE),
+        json!({ "repo": writer, "repoRev": "7zzzzzzzzzzzz", "data": { "$bytes": DATA } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], json!("FutureRev"), "{body}");
+}
+
+/// Service auth bound to `notifyWrite` doesn't reach `notifyRepoUpdate`.
+#[tokio::test]
+#[serial]
+async fn notify_repo_update_needs_auth_bound_to_it() {
+    common::require_db!();
+    let writer = WRITER;
+    let (status, body) = notify_as(
+        REPO_UPDATE,
+        writer,
+        Some("com.atproto.space.notifyWrite"),
+        json!({ "repo": writer, "repoRev": "3lzq2b3k4c22a", "data": { "$bytes": DATA } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+}
+
+/// Only the repo itself reports its state: another signer is refused, even
+/// one that may notify for others with `notifyWrite`.
+#[tokio::test]
+#[serial]
+async fn notify_repo_update_is_reported_by_the_repo_it_names() {
+    common::require_db!();
+    let (status, body) = notify_as(
+        REPO_UPDATE,
+        "did:plc:stranger",
+        Some(REPO_UPDATE),
+        json!({ "repo": WRITER, "repoRev": "3lzq2b3k4c22a", "data": { "$bytes": DATA } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// A session, even a super admin's, doesn't report a repo's state; only a
+/// repo host's service auth does.
+#[tokio::test]
+#[serial]
+async fn notify_repo_update_takes_service_auth_only() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+    let space = create_instance_space(&app, &instance_did).await;
+    let (name, value) = app.admin_cookie();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/xrpc/{REPO_UPDATE}"))
+        .header("content-type", "application/json")
+        .header(name, value)
+        .body(Body::from(
+            json!({ "space": space, "repo": WRITER, "repoRev": "3lzq2b3k4c22a", "data": { "$bytes": DATA } })
+                .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/xrpc/{REPO_UPDATE}"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "space": space }).to_string()))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// A FutureRev is answered before anything is fetched from the repo's host.
+#[tokio::test]
+#[serial]
+async fn notify_repo_update_refuses_a_future_rev_first() {
+    common::require_db!();
+    let (status, body) = notify_as(
+        REPO_UPDATE,
+        WRITER,
+        Some(REPO_UPDATE),
+        // For an unknown space too: the revision is checked first.
+        json!({ "repo": WRITER, "repoRev": "7zzzzzzzzzzzz", "data": { "$bytes": DATA } }),
+    )
+    .await;
+    assert_eq!(body["error"], json!("FutureRev"), "{status} {body}");
+}
+
+/// Past its hourly limit, a sender is answered `RateLimited`.
+#[tokio::test]
+#[serial]
+async fn notify_repo_update_limits_each_sender() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+    let space = create_instance_space(&app, &instance_did).await;
+    for _ in 0..1500 {
+        app.state.repo_update_senders.charge(WRITER).unwrap();
+    }
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            WRITER,
+            &instance_did,
+            "#atproto_space_host",
+            Some(REPO_UPDATE),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/xrpc/{REPO_UPDATE}"))
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .header("host", "127.0.0.1:0")
+        .body(Body::from(
+            json!({ "space": space, "repo": WRITER, "repoRev": "3lzq2b3k4c22a", "data": { "$bytes": DATA } })
+                .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// A super admin, who may notify for others with `notifyWrite`, doesn't
+/// report another repo's state with `notifyRepoUpdate`.
+#[tokio::test]
+#[serial]
+async fn notify_repo_update_has_no_admin_exception() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+    let space = create_instance_space(&app, &instance_did).await;
+    let admin = app.admin_did.clone();
+    let send = |lxm: &'static str, auth: String| {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/xrpc/{lxm}"))
+            .header("content-type", "application/json")
+            .header("authorization", auth)
+            .header("host", "127.0.0.1:0")
+            .body(Body::from(
+                json!({ "space": space, "repo": WRITER, "repoRev": "3lzq2b3k4c22a", "data": { "$bytes": DATA } })
+                    .to_string(),
+            ))
+            .unwrap()
+    };
+    // notifyWrite admits the admin for another repo, as it always did.
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            &admin,
+            &instance_did,
+            "#atproto_space_host",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(send("com.atproto.space.notifyWrite", auth))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // notifyRepoUpdate doesn't.
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            &admin,
+            &instance_did,
+            "#atproto_space_host",
+            Some(REPO_UPDATE),
+        )
+        .await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(send(REPO_UPDATE, auth))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// A report forwards the repo's state as it names it: the flat fields over
+/// a `latest` beside them, and no record writes announced from a
+/// `collection` and `rkey` it carries.
+#[tokio::test]
+#[serial]
+async fn notify_repo_update_forwards_its_state_only() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+    let space = create_instance_space(&app, &instance_did).await;
+    let space_row = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        &instance_did,
+        SPACE_TYPE,
+        SPACE_SKEY,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let syncer = common::syncer::start().await;
+    happyview::spaces::notifications::register(
+        &app.state.db,
+        app.state.db_backend,
+        &space_row.id,
+        "did:web:syncer.example#atproto_space_syncer",
+        &syncer.uri(),
+        "did:web:syncer.example",
+        NotifyDelivery::Xrpc,
+    )
+    .await
+    .unwrap();
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            WRITER,
+            &instance_did,
+            "#atproto_space_host",
+            Some(REPO_UPDATE),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/xrpc/{REPO_UPDATE}"))
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .header("host", "127.0.0.1:0")
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": WRITER,
+                "repoRev": "3lzq2b3k4c22a",
+                "data": { "$bytes": DATA },
+                "latest": { "rev": "3lzq2b3k4c22b", "data": { "$bytes": "AAAA" } },
+                "collection": "com.example.post",
+                "rkey": "rk1",
+                "cid": "bafyreidefdycgbfy3oglcb6ism3eqhyp5llsrpzxjsuac2gsy4mtrtx244",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let received = common::syncer::received(&syncer, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let received_now = common::syncer::received(&syncer, 1).await;
+    assert_eq!(received.len(), 1);
+    assert_eq!(received_now.len(), 1, "only the repo's state is forwarded");
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(body["repoRev"], json!("3lzq2b3k4c22a"), "{body}");
+    assert!(body.get("collection").is_none(), "{body}");
+}
+
+/// A token addressed to this instance doesn't stand for a space whose
+/// authority is another DID, and a token naming some other service of the
+/// instance doesn't reach it at all.
+#[tokio::test]
+#[serial]
+async fn notify_repo_update_is_addressed_to_the_spaces_authority() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+    create_space(&app).await;
+    let instance_space = create_instance_space(&app, &instance_did).await;
+    let send = |auth: String, space: String| {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/xrpc/{REPO_UPDATE}"))
+            .header("content-type", "application/json")
+            .header("authorization", auth)
+            .header("host", "127.0.0.1:0")
+            .body(Body::from(
+                json!({ "space": space, "repo": WRITER, "repoRev": "3lzq2b3k4c22a", "data": { "$bytes": DATA } })
+                    .to_string(),
+            ))
+            .unwrap()
+    };
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            WRITER,
+            &instance_did,
+            "#atproto_space_host",
+            Some(REPO_UPDATE),
+        )
+        .await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(send(auth, space_uri()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            WRITER,
+            &instance_did,
+            "#atproto_labeler",
+            Some(REPO_UPDATE),
+        )
+        .await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(send(auth, instance_space))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
