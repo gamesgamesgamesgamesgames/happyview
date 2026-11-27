@@ -404,6 +404,10 @@ const QUERY: &[(&str, &str)] = &[
         "/metrics/delivered",
         "from=2026-11-01T00:00:00Z&to=2026-11-02T00:00:00Z",
     ),
+    (
+        "/metrics/xrpc",
+        "from=2026-11-01T00:00:00Z&to=2026-11-02T00:00:00Z",
+    ),
 ];
 
 /// Routes the sweep cannot drive to a `2xx`, with the reason, and therefore

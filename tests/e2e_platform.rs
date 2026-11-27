@@ -877,6 +877,22 @@ async fn platform_key_can_read_script_and_ingest_metrics() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+
+    // And the XRPC requests, the platform's own call above among them.
+    let now = chrono::Utc::now();
+    let uri = format!(
+        "/admin/metrics/xrpc?from={}&step=1h",
+        (now - chrono::Duration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ")
+    );
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bearer(Method::GET, &uri, PLATFORM_KEY, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert!(body["points"].is_array(), "{body}");
 }
 
 /// `metrics:read` opens only the routes that opt in with `AllowPlatform`: the

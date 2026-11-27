@@ -218,6 +218,29 @@ pub(super) async fn delivered(
     Query(query): Query<DeliveredQuery>,
 ) -> Result<Json<Value>, AppError> {
     auth.require(Permission::MetricsRead).await?;
+    let (step, now, from, to) = counter_range(&query)?;
+    let width = step.secs();
+    let points = state
+        .metrics
+        .delivered()
+        .read(&state.db, state.db_backend, now, from, to, width)
+        .await
+        .map_err(read_failed)?;
+    let mut body = json!({
+        "step": step.as_str(),
+        "from": crate::metrics::rfc3339_of(from),
+        "to": crate::metrics::rfc3339_of(to),
+        "points": points,
+        // Ingest records the per-collection metrics dropped. Records
+        // delivered are counted apart and never dropped.
+        "overflow": state.metrics.overflow(),
+    });
+    stored_fields(&state, Window::Month, None, &mut body).await;
+    Ok(Json(body))
+}
+
+/// A counter read's step, now, and range, aligned to the step and checked.
+fn counter_range(query: &DeliveredQuery) -> Result<(Step, u64, u64, u64), AppError> {
     let step = match query.step.as_deref() {
         None => Step::Day,
         Some(raw) => match Step::parse(raw) {
@@ -252,10 +275,25 @@ pub(super) async fn delivered(
             "the range may be at most {MAX_DELIVERED_DAYS} days"
         )));
     }
+    Ok((step, now, from, to))
+}
+
+/// GET /admin/metrics/xrpc — the requests sent to paths under `/xrpc/`, by
+/// method kind, per UTC hour or day, with the same parameters as
+/// [`delivered`]. Every such request counts, whether or not it names a
+/// method the instance serves and whatever it answers; a CORS preflight
+/// counts as `other`. Counted independently of any instance setting.
+pub(super) async fn xrpc(
+    State(state): State<AppState>,
+    AllowPlatform(auth): AllowPlatform,
+    Query(query): Query<DeliveredQuery>,
+) -> Result<Json<Value>, AppError> {
+    auth.require(Permission::MetricsRead).await?;
+    let (step, now, from, to) = counter_range(&query)?;
     let points = state
         .metrics
-        .delivered()
-        .read(&state.db, state.db_backend, now, from, to, width)
+        .xrpc()
+        .read(&state.db, state.db_backend, now, from, to, step.secs())
         .await
         .map_err(read_failed)?;
     let mut body = json!({
@@ -263,9 +301,6 @@ pub(super) async fn delivered(
         "from": crate::metrics::rfc3339_of(from),
         "to": crate::metrics::rfc3339_of(to),
         "points": points,
-        // Ingest records the per-collection metrics dropped. Records
-        // delivered are counted apart and never dropped.
-        "overflow": state.metrics.overflow(),
     });
     stored_fields(&state, Window::Month, None, &mut body).await;
     Ok(Json(body))

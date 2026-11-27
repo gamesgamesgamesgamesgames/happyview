@@ -506,16 +506,17 @@ pub async fn sweep(
         return Ok(0);
     }
     let cutoff = rfc3339(now.saturating_sub(u64::from(days) * 86_400));
-    // Records delivered are kept for at least a usage meter's month.
+    // The usage meter's counters are kept for at least its month.
     let delivered_days = days.max(super::delivered::MIN_KEPT_DAYS);
     let delivered_cutoff = rfc3339(now.saturating_sub(u64::from(delivered_days) * 86_400));
     let result = crate::db::query(&adapt_sql(
         "DELETE FROM happyview_script_metrics WHERE bucket_start < ? \
-         AND (kind <> ? OR bucket_start < ?)",
+         AND (kind NOT IN (?, ?) OR bucket_start < ?)",
         backend,
     ))
     .bind(cutoff)
     .bind(super::delivered::KIND)
+    .bind(super::xrpc::KIND)
     .bind(delivered_cutoff)
     .execute(pool)
     .await?;
@@ -640,8 +641,8 @@ pub async fn fold(
             let encoded = match kind.as_str() {
                 k if k == Key::KIND => merge_rows::<Bucket>(&rows).encode(),
                 k if k == IngestKey::KIND => merge_rows::<IngestBucket>(&rows).encode(),
-                k if k == super::delivered::KIND => {
-                    (super::delivered::merge(&rows), "{}".to_string())
+                k if k == super::delivered::KIND || k == super::xrpc::KIND => {
+                    (super::counter::merge(&rows), "{}".to_string())
                 }
                 other => {
                     tracing::warn!(
@@ -739,6 +740,14 @@ impl Persister {
         {
             Ok(n) => outcome.written += n,
             Err(e) => tracing::warn!(error = %e, "failed to write records delivered"),
+        }
+        match metrics
+            .xrpc()
+            .write_closed(pool, backend, metrics.instance(), now)
+            .await
+        {
+            Ok(n) => outcome.written += n,
+            Err(e) => tracing::warn!(error = %e, "failed to write XRPC requests"),
         }
         if self
             .maintained_at
