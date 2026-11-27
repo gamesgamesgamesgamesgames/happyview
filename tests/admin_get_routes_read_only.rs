@@ -400,6 +400,10 @@ const QUERY: &[(&str, &str)] = &[
     // So it reaches the blob lookup rather than stopping at query extraction,
     // which is what its EXEMPT_FROM_SEEDING reason describes.
     ("/spaces/{id}/blob", "cid=bafkreisweepblob"),
+    (
+        "/metrics/delivered",
+        "from=2026-11-01T00:00:00Z&to=2026-11-02T00:00:00Z",
+    ),
 ];
 
 /// Routes the sweep cannot drive to a `2xx`, with the reason, and therefore

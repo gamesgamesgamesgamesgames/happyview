@@ -53,6 +53,64 @@ impl RecordDecision {
     }
 }
 
+/// Where a record handed to ingest came from, as its metrics key keeps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RecordOrigin {
+    /// A live event: the firehose, or a store feed row that isn't a crawl.
+    Live,
+    /// A backfill: a crawl of the network or of a repo, or a store crawl the
+    /// feed delivered.
+    Backfill,
+    /// A store pass: a backfill job that read the shared store's copy of a
+    /// collection rather than crawling it.
+    StorePass,
+    /// A dead-lettered record run again.
+    Retry,
+    /// Written before origins were kept.
+    Unknown,
+}
+
+/// Every origin's name, in [`RecordOrigin::index`] order.
+pub const ORIGINS: [&str; 5] = ["live", "backfill", "store_pass", "retry", "unknown"];
+
+/// The job id the network store's feed gives the crawl rows it delivers.
+/// A backfill from the store with any other job id is a store pass.
+const STORE_FEED_JOB: &str = "network_store";
+
+impl RecordOrigin {
+    pub fn of(ev: &RecordEvent) -> Self {
+        match &ev.origin {
+            Origin::Live => Self::Live,
+            Origin::Retry => Self::Retry,
+            Origin::Backfill { job_id } if ev.stored && job_id != STORE_FEED_JOB => Self::StorePass,
+            Origin::Backfill { .. } => Self::Backfill,
+        }
+    }
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn as_str(self) -> &'static str {
+        ORIGINS[self.index()]
+    }
+
+    /// The origin named `name`; a name this build doesn't know is
+    /// [`Unknown`](Self::Unknown).
+    pub fn parse(name: &str) -> Self {
+        [
+            Self::Live,
+            Self::Backfill,
+            Self::StorePass,
+            Self::Retry,
+            Self::Unknown,
+        ]
+        .into_iter()
+        .find(|o| o.as_str() == name)
+        .unwrap_or(Self::Unknown)
+    }
+}
+
 /// One record, finished.
 #[derive(Clone, Debug)]
 pub struct RecordSample {
@@ -136,12 +194,14 @@ pub fn note_dead_lettered() {
     });
 }
 
-/// One record being measured, or nothing while metrics are off.
-pub struct RecordTimer(Option<Box<Timing>>);
+/// One record being measured, or nothing while metrics are off. Either way
+/// its delivery is counted once, when it finishes.
+pub struct RecordTimer(Option<Box<Timing>>, Option<RecordOrigin>);
 
 struct Timing {
     collection: String,
     action: &'static str,
+    origin: RecordOrigin,
     job: Option<String>,
     started: Instant,
     collector: Arc<RecordCollector>,
@@ -153,27 +213,39 @@ struct Timing {
 
 impl RecordTimer {
     pub fn start(metrics: &ScriptMetrics, ev: &RecordEvent) -> Self {
+        let origin = RecordOrigin::of(ev);
         if !metrics.enabled() {
-            return Self(None);
+            return Self(None, Some(origin));
         }
-        Self(Some(Box::new(Timing {
-            collection: ev.key.collection.clone(),
-            action: ev.action.as_str(),
-            job: match &ev.origin {
-                Origin::Backfill { job_id } => Some(job_id.clone()),
-                Origin::Live | Origin::Retry => None,
-            },
-            started: Instant::now(),
-            collector: Arc::default(),
-            stages: Vec::new(),
-            decision: RecordDecision::Proceed,
-            hooked: None,
-        })))
+        Self(
+            Some(Box::new(Timing {
+                collection: ev.key.collection.clone(),
+                action: ev.action.as_str(),
+                origin,
+                job: match &ev.origin {
+                    Origin::Backfill { job_id } => Some(job_id.clone()),
+                    Origin::Live | Origin::Retry => None,
+                },
+                started: Instant::now(),
+                collector: Arc::default(),
+                stages: Vec::new(),
+                decision: RecordDecision::Proceed,
+                hooked: None,
+            })),
+            Some(origin),
+        )
     }
 
-    /// A timer that measures nothing.
+    /// The record wasn't delivered after all: its write failed, and the
+    /// source will hand it over again. Measured, but not counted.
+    pub fn undelivered(mut self) -> Self {
+        self.1 = None;
+        self
+    }
+
+    /// A timer that measures and counts nothing.
     pub fn off() -> Self {
-        Self(None)
+        Self(None, None)
     }
 
     /// Run the record's hook, `fut`: its lookup is `resolve`, the rest is
@@ -224,12 +296,16 @@ impl RecordTimer {
     /// The record is done, with `write` the stage and time of its write when
     /// it had one.
     pub fn finish(self, metrics: &ScriptMetrics, write: Option<(&'static str, Duration)>) {
+        if let Some(origin) = self.1 {
+            metrics.count_delivered(origin);
+        }
         let Some(timing) = self.0 else {
             return;
         };
         let Timing {
             collection,
             action,
+            origin,
             job,
             started,
             collector,
@@ -254,7 +330,7 @@ impl RecordTimer {
             dead_lettered: times.dead_lettered,
         };
         drop(times);
-        metrics.record_ingest(&collection, action, job.as_deref(), &sample);
+        metrics.record_ingest(&collection, action, origin, job.as_deref(), &sample);
     }
 }
 
@@ -449,6 +525,32 @@ mod tests {
         assert_eq!(job.outcomes["replace"], 1);
     }
 
+    #[test]
+    fn an_origin_tells_a_store_pass_from_the_feed_and_a_crawl() {
+        let backfill = |job: &str, stored| RecordEvent {
+            stored,
+            ..event(Origin::Backfill { job_id: job.into() })
+        };
+        assert_eq!(RecordOrigin::of(&event(Origin::Live)), RecordOrigin::Live);
+        assert_eq!(RecordOrigin::of(&event(Origin::Retry)), RecordOrigin::Retry);
+        assert_eq!(
+            RecordOrigin::of(&backfill("job", false)),
+            RecordOrigin::Backfill
+        );
+        assert_eq!(
+            RecordOrigin::of(&backfill(STORE_FEED_JOB, true)),
+            RecordOrigin::Backfill
+        );
+        assert_eq!(
+            RecordOrigin::of(&backfill("job", true)),
+            RecordOrigin::StorePass
+        );
+        for name in ORIGINS {
+            assert_eq!(RecordOrigin::parse(name).as_str(), name);
+        }
+        assert_eq!(RecordOrigin::parse("elsewhere"), RecordOrigin::Unknown);
+    }
+
     #[tokio::test]
     async fn a_record_with_no_hook_has_no_hook_stage_and_no_script_time() {
         let metrics = ScriptMetrics::new();
@@ -474,6 +576,35 @@ mod tests {
         timer.hooking(async { note_dead_lettered() }).await;
         timer.finish(&metrics, None);
         assert!(metrics.ingest(super::super::Window::Hour).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_delivery_is_counted_once_whether_or_not_metrics_are_on() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let metrics = ScriptMetrics::new();
+        metrics.set_enabled(false);
+        RecordTimer::start(&metrics, &event(Origin::Live)).finish(&metrics, None);
+        metrics.set_enabled(true);
+        RecordTimer::start(&metrics, &event(Origin::Retry)).finish(&metrics, None);
+        // A timer that measures nothing counts nothing.
+        RecordTimer::off().finish(&metrics, None);
+        let now = super::super::unix_now();
+        let points = metrics
+            .delivered()
+            .read(
+                &pool,
+                crate::db::DatabaseBackend::Sqlite,
+                now,
+                now - 3_600,
+                now + 3_600,
+                3_600,
+            )
+            .await
+            .unwrap();
+        let total: u64 = points.iter().map(|p| p.records).sum();
+        assert_eq!(total, 2);
+        let live: u64 = points.iter().filter_map(|p| p.origins.get("live")).sum();
+        assert_eq!(live, 1);
     }
 
     #[tokio::test]
