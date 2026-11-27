@@ -32,4 +32,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). In short: open PRs against `dev`, sign o
 
 ## Documentation
 
-Full documentation is available at [happyview.dev](https://happyview.dev).
+Full documentation is available at [v2.happyview.dev](https://v2.happyview.dev).
