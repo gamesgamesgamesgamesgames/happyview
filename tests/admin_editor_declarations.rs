@@ -63,6 +63,7 @@ async fn put_lexicon(app: &TestApp, id: &str) {
                 }),
                 backfill: false,
                 token_cost: None,
+                rate_limited: true,
                 authority_did: None,
                 indexed: true,
             },

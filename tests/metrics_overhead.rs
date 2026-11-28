@@ -79,6 +79,7 @@ async fn what_metrics_cost_a_trivially_hooked_record() {
                 }),
                 backfill: false,
                 token_cost: None,
+                rate_limited: true,
                 authority_did: None,
                 indexed: true,
             },

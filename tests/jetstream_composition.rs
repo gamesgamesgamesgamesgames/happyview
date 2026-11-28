@@ -86,6 +86,7 @@ async fn app(collections: &[&str]) -> Option<(TestApp, watch::Sender<Vec<String>
                     lexicon_json: record_lexicon(collection),
                     backfill: false,
                     token_cost: None,
+                    rate_limited: true,
                     authority_did: None,
                     indexed: true,
                 },

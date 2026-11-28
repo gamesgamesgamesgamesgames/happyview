@@ -40,6 +40,7 @@ async fn app() -> TestApp {
                 lexicon_json: common::fixtures::game_record_lexicon(),
                 backfill: false,
                 token_cost: None,
+                rate_limited: true,
                 authority_did: None,
                 indexed: true,
             },

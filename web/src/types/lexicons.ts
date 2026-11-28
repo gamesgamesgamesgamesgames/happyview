@@ -20,6 +20,8 @@ export interface LexiconSummary {
   /** Listed in happyview.toml, which would restore it after a delete. */
   declared: boolean;
   token_cost: number | null;
+  /** Whether a call to this query or procedure pays its token cost. */
+  rate_limited: boolean;
 }
 
 export interface LexiconDetail extends LexiconSummary {

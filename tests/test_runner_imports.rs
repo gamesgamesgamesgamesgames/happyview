@@ -106,6 +106,7 @@ async fn a_query_served_on_a_test_state_cannot_reach_the_harness() {
                 lexicon_json: common::fixtures::list_games_query_lexicon(),
                 backfill: false,
                 token_cost: None,
+                rate_limited: true,
                 authority_did: None,
                 indexed: true,
             },
@@ -866,6 +867,7 @@ fn procedure_lexicon() -> LexiconWrite {
         }}}),
         backfill: false,
         token_cost: None,
+        rate_limited: true,
         authority_did: None,
         indexed: true,
     }

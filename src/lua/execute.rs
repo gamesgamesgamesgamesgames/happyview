@@ -496,6 +496,7 @@ mod tests {
             raw: serde_json::json!({ "id": "com.example.probe" }),
             revision: 1,
             token_cost: None,
+            rate_limited: true,
             space_type: None,
             space_name: None,
             space_collections: None,

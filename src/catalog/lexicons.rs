@@ -71,6 +71,8 @@ pub struct LexiconWrite {
     /// Whether the collection is ingested from the network. Only a record
     /// lexicon can be indexed; the flag is inert on any other type.
     pub indexed: bool,
+    /// Whether a call to this query or procedure pays its token cost.
+    pub rate_limited: bool,
 }
 
 impl LexiconWrite {
@@ -85,12 +87,14 @@ impl LexiconWrite {
     }
 
     fn parse(&self, revision: i32) -> Result<ParsedLexicon, CatalogError> {
-        ParsedLexicon::parse(
+        let mut parsed = ParsedLexicon::parse(
             self.lexicon_json.clone(),
             revision,
             self.token_cost.map(|c| c as u32),
         )
-        .map_err(|e| CatalogError::Invalid(format!("failed to parse lexicon: {e}")))
+        .map_err(|e| CatalogError::Invalid(format!("failed to parse lexicon: {e}")))?;
+        parsed.rate_limited = self.rate_limited;
+        Ok(parsed)
     }
 }
 
@@ -113,6 +117,7 @@ pub struct LexiconListing {
     pub updated_at: Option<String>,
     pub token_cost: Option<i32>,
     pub indexed: bool,
+    pub rate_limited: bool,
 }
 
 impl LexiconListing {
@@ -133,6 +138,7 @@ impl LexiconListing {
             updated_at: Some(row.updated_at),
             token_cost: row.token_cost,
             indexed: row.indexed,
+            rate_limited: row.rate_limited,
         }
     }
 
@@ -151,6 +157,7 @@ impl LexiconListing {
             updated_at: None,
             token_cost: lex.parsed.token_cost.map(|c| c as i32),
             indexed: lex.indexed,
+            rate_limited: lex.parsed.rate_limited,
         }
     }
 }
@@ -237,7 +244,8 @@ impl LexiconCatalog {
                 }
             };
             match ParsedLexicon::parse(json, row.revision, row.token_cost.map(|c| c as u32)) {
-                Ok(parsed) => {
+                Ok(mut parsed) => {
+                    parsed.rate_limited = row.rate_limited;
                     loaded.insert(
                         id,
                         StoredLexicon {
@@ -468,6 +476,7 @@ impl LexiconCatalog {
         let mut parsed =
             ParsedLexicon::parse(lexicon_json.clone(), 1, current.parsed.token_cost)
                 .map_err(|e| NetworkWriteError::Invalid(format!("failed to parse lexicon: {e}")))?;
+        parsed.rate_limited = current.parsed.rate_limited;
         let Some(revision) = crate::db::retry_on_busy(|| {
             lexicon_rows::refresh_network(db, backend, id, &lexicon_json)
         })
@@ -504,12 +513,13 @@ impl LexiconCatalog {
         }
         // A placeholder document: the caller replaces it, and only the row's
         // settings are read from it.
-        let placeholder = ParsedLexicon::parse(
+        let mut placeholder = ParsedLexicon::parse(
             serde_json::json!({"lexicon": 1, "id": id, "defs": {}}),
             row.revision,
             row.token_cost.map(|c| c as u32),
         )
         .map_err(|e| NetworkWriteError::Invalid(format!("failed to parse lexicon: {e}")))?;
+        placeholder.rate_limited = row.rate_limited;
         Ok(Some(NetworkLexicon {
             parsed: placeholder,
             authority_did: row.authority_did,
@@ -1014,6 +1024,7 @@ mod tests {
             lexicon_json: json,
             backfill: false,
             token_cost: None,
+            rate_limited: true,
             authority_did: None,
             indexed: true,
         }

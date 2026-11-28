@@ -80,13 +80,10 @@ pub(crate) async fn track_network_lexicon(
     // Ahead of resolution: a file the project owns is never the network's.
     lexicons.check_writable(nsid)?;
 
-    let indexed = match indexed {
-        Some(v) => v,
-        None => lexicons
-            .get_listing(db, backend, nsid)
-            .await?
-            .is_none_or(|l| l.indexed),
-    };
+    let existing = lexicons.get_listing(db, backend, nsid).await?;
+    let indexed = indexed.unwrap_or_else(|| existing.as_ref().is_none_or(|l| l.indexed));
+    // Not a network setting: a refetch keeps what an operator chose.
+    let rate_limited = existing.as_ref().is_none_or(|l| l.rate_limited);
 
     let (authority_did, pds_endpoint) = resolve_nsid_authority(http, plc_url, nsid).await?;
     let lexicon_json = fetch_lexicon_from_pds(http, &pds_endpoint, &authority_did, nsid).await?;
@@ -101,6 +98,7 @@ pub(crate) async fn track_network_lexicon(
                 token_cost: None,
                 authority_did: Some(authority_did.clone()),
                 indexed,
+                rate_limited,
             },
         )
         .await?;
@@ -431,6 +429,7 @@ mod tests {
                     lexicon_json: serde_json::json!({"lexicon":1,"id":"at.example.mine","defs":{"main":{"type":"record","key":"tid","record":{"type":"object","properties":{}}}}}),
                     backfill: false,
                     token_cost: None,
+                    rate_limited: true,
                     authority_did: None,
                     indexed: true,
                 },
@@ -467,6 +466,7 @@ mod tests {
                     lexicon_json: serde_json::json!({"lexicon":1,"id":"at.example.mine","defs":{"main":{"type":"record","key":"tid","record":{"type":"object","properties":{}}}}}),
                     backfill: false,
                     token_cost: None,
+                    rate_limited: true,
                     authority_did: None,
                     indexed: true,
                 },

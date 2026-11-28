@@ -116,6 +116,7 @@ async fn put_lexicon(state: &AppState, lexicon: Value) {
                 lexicon_json: lexicon,
                 backfill: false,
                 token_cost: None,
+                rate_limited: true,
                 authority_did: None,
                 indexed: true,
             },

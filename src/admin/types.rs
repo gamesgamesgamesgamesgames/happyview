@@ -34,6 +34,9 @@ pub(super) struct LexiconSummary {
     pub(super) token_cost: Option<i32>,
     /// Whether the ingest watches this record lexicon's collection.
     pub(super) indexed: bool,
+    /// Whether a call to this query or procedure pays its token cost. True
+    /// for every other type, where it means nothing.
+    pub(super) rate_limited: bool,
 }
 
 impl From<crate::catalog::LexiconListing> for LexiconSummary {
@@ -65,6 +68,7 @@ impl From<crate::catalog::LexiconListing> for LexiconSummary {
             record_schema,
             token_cost: l.token_cost,
             indexed: l.indexed,
+            rate_limited: l.rate_limited,
         }
     }
 }
@@ -78,6 +82,9 @@ pub(super) struct UploadLexiconBody {
     /// Left out, an update keeps the stored setting and a new lexicon is
     /// indexed, so a client that predates the field never flips it.
     pub(super) indexed: Option<bool>,
+    /// Left out, an update keeps the stored setting and a new lexicon is
+    /// rate limited, as with `indexed`.
+    pub(super) rate_limited: Option<bool>,
 }
 
 fn default_backfill() -> bool {

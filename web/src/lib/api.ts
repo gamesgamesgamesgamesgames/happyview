@@ -293,6 +293,7 @@ export function uploadLexicon(body: {
   backfill?: boolean;
   indexed?: boolean;
   token_cost?: number | null;
+  rate_limited?: boolean;
 }) {
   return apiFetch<{
     id: string;

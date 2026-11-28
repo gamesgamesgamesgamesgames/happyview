@@ -606,6 +606,118 @@ async fn an_upload_without_the_field_is_indexed() {
     assert!(app.state.collections_tx.borrow().iter().any(|c| c == GAME));
 }
 
+const LIST_GAMES: &str = "games.gamesgamesgamesgames.listGames";
+
+async fn upload_list_games(app: &TestApp, extra: Value) {
+    let mut body = json!({ "lexicon_json": fixtures::list_games_query_lexicon() });
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+}
+
+async fn reported_rate_limited(app: &TestApp, id: &str) -> Value {
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            &format!("/admin/lexicons/{id}"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    json_body(resp).await["rate_limited"].clone()
+}
+
+#[tokio::test]
+#[serial]
+async fn an_upload_without_rate_limited_is_rate_limited() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    upload_list_games(&app, json!({})).await;
+    upload_game(&app, json!({})).await;
+
+    assert_eq!(reported_rate_limited(&app, LIST_GAMES).await, json!(true));
+    // Inert on a record lexicon, but listed all the same.
+    assert_eq!(reported_rate_limited(&app, GAME).await, json!(true));
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get("/admin/lexicons", app.admin_cookie()))
+        .await
+        .unwrap();
+    let list = json_body(resp).await;
+    for lexicon in list.as_array().unwrap() {
+        assert_eq!(lexicon["rate_limited"], json!(true), "{}", lexicon["id"]);
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn re_uploading_without_rate_limited_keeps_it_off() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    upload_list_games(&app, json!({ "rate_limited": false })).await;
+    assert_eq!(reported_rate_limited(&app, LIST_GAMES).await, json!(false));
+
+    upload_list_games(&app, json!({ "token_cost": 3 })).await;
+    assert_eq!(reported_rate_limited(&app, LIST_GAMES).await, json!(false));
+    assert!(
+        !app.state
+            .lexicons
+            .get(LIST_GAMES)
+            .await
+            .unwrap()
+            .rate_limited,
+        "memory agrees with the row"
+    );
+
+    upload_list_games(&app, json!({ "rate_limited": true })).await;
+    assert_eq!(reported_rate_limited(&app, LIST_GAMES).await, json!(true));
+}
+
+#[tokio::test]
+#[serial]
+async fn a_row_stored_before_the_column_existed_is_rate_limited() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let sql = adapt_sql(
+        "INSERT INTO happyview_lexicons (id, lexicon_json, backfill, source, created_at, updated_at) VALUES (?, ?, 0, 'manual', ?, ?)",
+        app.state.db_backend,
+    );
+    let now = now_rfc3339();
+    happyview::db::query(&sql)
+        .bind(LIST_GAMES)
+        .bind(fixtures::list_games_query_lexicon().to_string())
+        .bind(&now)
+        .bind(&now)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+    app.state
+        .lexicons
+        .load_from_db(&app.state.db)
+        .await
+        .unwrap();
+
+    assert_eq!(reported_rate_limited(&app, LIST_GAMES).await, json!(true));
+    assert!(
+        app.state
+            .lexicons
+            .get(LIST_GAMES)
+            .await
+            .unwrap()
+            .rate_limited
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn query_lexicon_with_backfill_starts_no_job() {
@@ -865,6 +977,7 @@ async fn stats_with_seeded_records() {
                 lexicon_json: lexicon_json_val,
                 backfill: false,
                 token_cost: None,
+                rate_limited: true,
                 authority_did: None,
                 indexed: true,
             },

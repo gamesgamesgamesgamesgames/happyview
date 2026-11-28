@@ -348,6 +348,7 @@ async fn pipeline_state(mock: &MockServer, collections: &[&str]) -> AppState {
                     lexicon_json: record_lexicon(nsid).0,
                     backfill: true,
                     token_cost: None,
+                    rate_limited: true,
                     authority_did: None,
                     indexed: true,
                 },

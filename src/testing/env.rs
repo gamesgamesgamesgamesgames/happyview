@@ -396,6 +396,7 @@ mod tests {
             }),
             backfill: false,
             token_cost: None,
+            rate_limited: true,
             authority_did: None,
             indexed: true,
         }

@@ -16,6 +16,7 @@ pub async fn lexicon(state: &AppState, doc: Value) {
                 lexicon_json: doc,
                 backfill: false,
                 token_cost: None,
+                rate_limited: true,
                 authority_did: None,
                 indexed: true,
             },
