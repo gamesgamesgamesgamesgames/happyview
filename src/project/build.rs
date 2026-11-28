@@ -517,6 +517,7 @@ pub(crate) fn same_lexicon(a: &ProjectLexicon, b: &ProjectLexicon) -> bool {
         && a.backfill == b.backfill
         && a.parsed.raw == b.parsed.raw
         && a.parsed.token_cost == b.parsed.token_cost
+        && a.parsed.rate_limited == b.parsed.rate_limited
 }
 
 pub(crate) fn same_script(a: &ProjectScript, b: &ProjectScript) -> bool {
@@ -1207,6 +1208,7 @@ mod tests {
                     .unwrap(),
                     backfill: false,
                     token_cost: None,
+                    rate_limited: true,
                     authority_did: None,
                     indexed: true,
                 },

@@ -39,6 +39,9 @@ pub struct ParsedLexicon {
     pub revision: i32,
     /// Optional per-NSID token cost for rate limiting.
     pub token_cost: Option<u32>,
+    /// Whether a call to this query or procedure pays its token cost. On
+    /// unless the lexicon's settings turn it off; inert on other types.
+    pub rate_limited: bool,
     /// Optional space type NSID indicating this lexicon is designed for use within spaces of that type.
     pub space_type: Option<String>,
     /// For space declarations: the human-readable name (1-64 chars).
@@ -131,6 +134,7 @@ impl ParsedLexicon {
             raw,
             revision,
             token_cost,
+            rate_limited: true,
             space_type,
             space_name,
             space_collections,

@@ -347,3 +347,82 @@ async fn upload_lexicon_with_malformed_nsid_returns_400() {
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+// ---------------------------------------------------------------------------
+// Per-lexicon rate limiting
+// ---------------------------------------------------------------------------
+
+async fn upload_list_games(app: &TestApp, extra: Value) {
+    let mut body = json!({ "lexicon_json": fixtures::list_games_query_lexicon() });
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+}
+
+/// One token in the anonymous bucket, refilled too slowly to matter.
+fn one_anonymous_token(app: &TestApp) {
+    app.state.rate_limiter.register_client_limit(
+        "anonymous".into(),
+        Some(1),
+        Some(0.000_1),
+        100,
+        2.0,
+    );
+}
+
+async fn list_games_status(app: &TestApp) -> StatusCode {
+    app.router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/games.gamesgamesgamesgames.listGames?limit=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+#[serial]
+async fn a_query_is_rate_limited_by_default() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    upload_list_games(&app, json!({})).await;
+    one_anonymous_token(&app);
+
+    assert_ne!(list_games_status(&app).await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(list_games_status(&app).await, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_query_with_rate_limiting_off_spends_no_tokens() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    upload_list_games(&app, json!({ "rate_limited": false, "token_cost": 5 })).await;
+    // Read back from the table, as a restart would.
+    app.state
+        .lexicons
+        .load_from_db(&app.state.db)
+        .await
+        .unwrap();
+    one_anonymous_token(&app);
+
+    for _ in 0..3 {
+        let status = list_games_status(&app).await;
+        assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+    assert!(matches!(
+        app.state.rate_limiter.check("anonymous", 1),
+        happyview::rate_limit::CheckResult::Allowed { .. }
+    ));
+}

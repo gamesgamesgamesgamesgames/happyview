@@ -57,14 +57,17 @@ pub(super) async fn upload_lexicon(
     // to.
     let warnings = issues;
 
-    let indexed = match body.indexed {
-        Some(v) => v,
-        None => state
-            .lexicons
-            .get_listing(&state.db, backend, &id)
-            .await?
-            .is_none_or(|l| l.indexed),
+    // An omitted setting keeps the stored row's, or is on for a new lexicon.
+    let existing = match (body.indexed, body.rate_limited) {
+        (Some(_), Some(_)) => None,
+        _ => state.lexicons.get_listing(&state.db, backend, &id).await?,
     };
+    let indexed = body
+        .indexed
+        .unwrap_or_else(|| existing.as_ref().is_none_or(|l| l.indexed));
+    let rate_limited = body
+        .rate_limited
+        .unwrap_or_else(|| existing.as_ref().is_none_or(|l| l.rate_limited));
 
     let revision = state
         .lexicons
@@ -77,6 +80,7 @@ pub(super) async fn upload_lexicon(
                 token_cost: body.token_cost,
                 authority_did: None,
                 indexed,
+                rate_limited,
             },
         )
         .await?;

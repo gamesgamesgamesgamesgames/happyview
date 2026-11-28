@@ -89,8 +89,9 @@ pub fn load_lexicon(
     }
 
     let overrides = overrides.get(&id);
-    let parsed = ParsedLexicon::parse(raw, 1, overrides.and_then(|o| o.token_cost))
+    let mut parsed = ParsedLexicon::parse(raw, 1, overrides.and_then(|o| o.token_cost))
         .map_err(|e| Diagnostic::error(&path, format!("failed to parse lexicon: {e}")))?;
+    parsed.rate_limited = overrides.and_then(|o| o.rate_limited).unwrap_or(true);
     Ok(project_lexicon(
         parsed,
         path,
@@ -213,6 +214,7 @@ mod tests {
             "com.example.getThing".to_string(),
             LexiconOverride {
                 token_cost: Some(5),
+                rate_limited: Some(false),
                 backfill: Some(true),
                 ..Default::default()
             },
@@ -221,6 +223,7 @@ mod tests {
         assert_eq!(lexicon.parsed.id, "com.example.getThing");
         assert_eq!(lexicon.parsed.lexicon_type, LexiconType::Query);
         assert_eq!(lexicon.parsed.token_cost, Some(5));
+        assert!(!lexicon.parsed.rate_limited);
         assert!(lexicon.backfill);
         assert_eq!(
             lexicon.path,
@@ -230,6 +233,7 @@ mod tests {
         let plain = load_lexicon(&file, &BTreeMap::new()).unwrap();
         assert!(!plain.backfill);
         assert_eq!(plain.parsed.token_cost, None);
+        assert!(plain.parsed.rate_limited, "rate limited unless turned off");
     }
 
     #[test]

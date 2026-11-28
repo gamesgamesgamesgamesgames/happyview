@@ -544,7 +544,12 @@ pub async fn xrpc_get(
         state.rate_limiter.default_cost_for_type(&rate_key, "proxy")
     };
 
-    let check = state.rate_limiter.check(&rate_key, cost);
+    // A lexicon with rate limiting turned off spends nothing.
+    let check = if lexicon.as_ref().is_some_and(|l| !l.rate_limited) {
+        CheckResult::Disabled
+    } else {
+        state.rate_limiter.check(&rate_key, cost)
+    };
 
     match check {
         CheckResult::Limited {
@@ -736,7 +741,12 @@ pub async fn xrpc_post(
         state.rate_limiter.default_cost_for_type(&rate_key, "proxy")
     };
 
-    let check = state.rate_limiter.check(&rate_key, cost);
+    // A lexicon with rate limiting turned off spends nothing.
+    let check = if lexicon.as_ref().is_some_and(|l| !l.rate_limited) {
+        CheckResult::Disabled
+    } else {
+        state.rate_limiter.check(&rate_key, cost)
+    };
 
     match check {
         CheckResult::Limited {

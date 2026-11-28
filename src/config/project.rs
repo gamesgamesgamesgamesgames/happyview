@@ -121,6 +121,8 @@ pub struct LexiconOverride {
     pub backfill: Option<bool>,
     pub token_cost: Option<u32>,
     pub indexed: Option<bool>,
+    /// Off, a call to this query or procedure pays no token cost.
+    pub rate_limited: Option<bool>,
 }
 
 impl ProjectConfig {
@@ -666,6 +668,7 @@ compression = false
 
 [lexicons."at.happyproto.registry.getArtifact"]
 token_cost = 2
+rate_limited = false
 
 [lexicons."software.release.manifest"]
 backfill = true
@@ -736,6 +739,7 @@ capabilities = ["library:call"]
 
         let get = &config.lexicons["at.happyproto.registry.getArtifact"];
         assert_eq!(get.token_cost, Some(2));
+        assert_eq!(get.rate_limited, Some(false));
         assert_eq!(get.backfill, None, "an unset override stays unset");
         assert_eq!(
             config.lexicons["software.release.manifest"].backfill,
@@ -748,6 +752,7 @@ capabilities = ["library:call"]
         assert_eq!(get.indexed, None, "an unset override stays unset");
         let put = &config.lexicons["at.happyproto.registry.putArtifact"];
         assert_eq!(put.token_cost, Some(5));
+        assert_eq!(put.rate_limited, None, "an unset override stays unset");
 
         let script = &config.scripts["xrpc.query:at.happyproto.registry.getArtifact"];
         assert_eq!(script.description.as_deref(), Some("Fetch one artifact"));

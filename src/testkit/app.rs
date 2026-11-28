@@ -478,6 +478,7 @@ mod provider_app {
                         lexicon_json: lexicon,
                         backfill: false,
                         token_cost: None,
+                        rate_limited: true,
                         authority_did: None,
                         indexed: true,
                     },
